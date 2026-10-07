@@ -1,0 +1,23 @@
+# 运行期产物：不要提交
+kun-pet-settings.json
+kun-pet-desktop.log
+desktop/kun-pet-settings.json
+desktop/kun-pet-desktop.log
+*.log
+
+# 网页内嵌小宠的开关脚本会自动生成的「原始版本」快照
+plugin/client-original.js
+
+# 安装/卸载脚本留下的配置备份
+cordis.patch.yml.bak-*
+
+# 临时文件
+*.bak
+*.orig
+*~
+
+# Windows
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/

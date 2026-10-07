@@ -1,0 +1,24 @@
+* text=auto
+
+# 脚本统一 LF，避免在别人机器上出现 CRLF 混用
+*.ps1   text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+
+# Windows 启动器必须是 CRLF，否则 cmd.exe 可能出错
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.vbs   text eol=crlf
+
+# 二进制素材：不做行尾/编码转换
+*.png   binary
+*.webp  binary
+
+# 让 GitHub 语言统计更真实（否则会被大体积素材 / 内嵌 base64 带偏）
+*.png   linguist-vendored
+*.webp  linguist-vendored
+plugin/client.js linguist-generated

@@ -1,0 +1,26 @@
+{
+  "name": "@local/kun-pet",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Kun Like 桌宠（静态移植版）：Web 界面右下角小宠，随 Agent 工作状态切换动作与气泡文案，任务完成播放提示音",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  },
+  "meta": {
+    "title": "Kun Like 桌宠",
+    "description": "右下角桌面宠物：随 Agent 工作状态显示动画与气泡，任务完成/出错即时提示"
+  }
+}

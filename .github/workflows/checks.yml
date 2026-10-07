@@ -1,0 +1,88 @@
+# 仓库自检：语法、路径泄漏、素材完整性。
+# 桌宠只能在 Windows 上跑，但静态检查可以放在 Linux runner 上做（更快更省）。
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 与 Windows 行尾一致性检查（启动器必须是 CRLF）
+        run: |
+          set -e
+          fail=0
+          for f in desktop/*.bat desktop/*.vbs tools/autostart/*.cmd; do
+            if [ -f "$f" ]; then
+              if ! grep -q $'\r' "$f"; then
+                echo "::error file=$f::应为 CRLF 行尾（.gitattributes 已声明，请检查是否被改写）"
+                fail=1
+              fi
+            fi
+          done
+          exit $fail
+
+      - name: 不要提交绝对路径 / 运行期产物
+        run: |
+          set -e
+          fail=0
+          # 允许出现在文档里的示例路径（C:\Users\<name>），但不允许真实用户名。
+          # 必须排除本文件自身，否则规则里的模式会匹配到自己。
+          if grep -rIn --exclude-dir=.git --exclude-dir=.github -E 'C:\\\\Users\\\\(Administrator|[A-Za-z0-9_-]+)|E:\\\\Users' . ; then
+            echo "::error::发现硬编码的绝对路径，请改成 %USERPROFILE% 之类"
+            fail=1
+          fi
+          if [ -f desktop/kun-pet-settings.json ] || [ -f desktop/kun-pet-desktop.log ]; then
+            echo "::error::运行期产物不该入库（kun-pet-settings.json / kun-pet-desktop.log）"
+            fail=1
+          fi
+          exit $fail
+
+      - name: PowerShell 语法检查
+        shell: pwsh
+        run: |
+          $fail = 0
+          Get-ChildItem -Recurse -Include *.ps1 -File | ForEach-Object {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs)
+            if ($errs -and $errs.Count) {
+              $fail = 1
+              Write-Host ("::error file=" + $_.FullName + "::parse error: " + ($errs[0].Message))
+            } else {
+              Write-Host ("ok  " + $_.Name)
+            }
+          }
+          if ($fail -ne 0) { exit 1 }
+
+      - name: 中文脚本必须有 UTF-8 BOM（否则 Windows PowerShell 5.1 会按 ANSI 解码而报错）
+        shell: pwsh
+        run: |
+          $fail = 0
+          Get-ChildItem -Recurse -Include *.ps1 -File | ForEach-Object {
+            $bytes = [IO.File]::ReadAllBytes($_.FullName)
+            $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+            $nonAscii = ($bytes | Where-Object { $_ -gt 127 }).Count
+            if ($nonAscii -gt 0 -and -not $hasBom) {
+              $fail = 1
+              Write-Host ("::error file=" + $_.FullName + "::含非 ASCII 字符但没有 UTF-8 BOM")
+            }
+          }
+          # 纯 ASCII 的脚本不需要 BOM；反过来，带 BOM 的也没问题
+          if ($fail -ne 0) { exit 1 }
+
+      - name: Node 语法检查
+        run: |
+          node --check plugin/index.js
+          node --check plugin/client.js
+
+      - name: 素材完整性（pet.json 可解析 + 精灵图尺寸）
+        run: python3 docs/tools/verify-assets.py
+
+      - name: README 里引用的本地文件都存在
+        run: python3 docs/tools/verify-links.py

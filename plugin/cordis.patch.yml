@@ -1,0 +1,5 @@
+# kun-pet bundle：Host 半区（状态机 + /kun-pet/state 路由），Client 半区（桌宠渲染）。
+- insert:
+    - id: kun-pet
+      name: '@local/kun-pet'
+      config: {}
