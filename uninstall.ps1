@@ -5,7 +5,7 @@
     1. 结束**安装目录里**正在运行的桌宠进程
     2. 删除安装目录（默认 %USERPROFILE%\kun-desktop-pet）
 
-  其它东西默认不动，需要时显式加开关：
+  其他东西默认不动，需要时显式加开关：
     -RemoveAssets      删掉 ~/.petdex/pets 下由本仓库自带的素材（ikkun / haiyue-classic）
     -RemovePlugin      删掉 DSH profile 里的 @local/kun-pet 插件与 cordis.patch.yml 里的 insert
     -RemoveAutostart   删掉「启动」文件夹里的 KunPet-autostart.cmd 与 KunPet-pet-running.ps1
@@ -88,7 +88,7 @@ if ($KeepFiles) {
 } elseif (-not $targetFull -or -not (Test-Path $targetFull)) {
     Info ("目录不存在，跳过: " + $Target)
 } else {
-    # 安全校验：绝不去删看起来不像桌宠目录的东西
+    # 安全校验：绝不去删看起来不像桌宠目录的东西。
     $marker = Join-Path $targetFull 'kun-pet-desktop.ps1'
     if (-not (Test-Path $marker)) {
         Warn ("该目录里没有 kun-pet-desktop.ps1，为安全起见不删除: " + $targetFull)
@@ -99,7 +99,7 @@ if ($KeepFiles) {
     }
 }
 
-# ---------------- 3. 素材 ----------------
+# ---------------- 3. 形象素材 ----------------
 Write-Host ""
 Write-Host "3) 形象素材" -ForegroundColor Cyan
 if (-not $RemoveAssets) {

@@ -15,8 +15,9 @@
     - 否则使用内置矢量形象（零素材依赖）
 
   任务状态来源（自动降级）：
-    1) DSH 插件接口  http://127.0.0.1:19387/kun-pet/state
-    2) DSH 会话目录活跃度  ~/.dsh/sessions
+    1) DSH 会话投影缓存  ~/.dsh/storages/session_projcache/sessions/*.json
+    2) DSH 插件接口  http://127.0.0.1:19387/kun-pet/state（可补“正在执行哪个工具”与审批）
+    3) DSH 会话目录活跃度（兜底）  ~/.dsh/sessions
 #>
 
 $ErrorActionPreference = 'Continue'
@@ -24,7 +25,7 @@ $ErrorActionPreference = 'Continue'
 # ---------------- 配置 ----------------
 # PowerShell 5.1 不允许 if 作为表达式出现在参数位置，先算好常量
 $script:codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
-# 日志与设置必须固定放在脚本所在目录，否则「双击启动」和「开机自启启动」会各自读写
+# 日志与设置必须固定放在脚本所在目录，否则「双击启动」和「开机自启」会各自读写
 # 不同的 kun-pet-settings.json，导致换个方式启动就恢复不出上次的宠物。
 # 三个启动器都通过 ScriptBlock::Create 执行脚本，此时 $PSScriptRoot 为空，
 # 所以由启动器显式传入 $cwd；直接运行 .ps1 时回退到命令自身路径。
@@ -669,7 +670,7 @@ function Render-PausedFrame {
             'harness'  { 'Harness 实时' }
             'dsh'      { 'DSH 插件接口' }
             'dsh-file' { 'DSH 插件快照文件' }
-            'sessions' { '会话活跃度(兜底)' }
+            'sessions' { '会话活跃度（兜底）' }
             default    { '未连接' }
         }
         $hintValue = '{0} · 已暂停' -f $sourceLabel
@@ -1330,7 +1331,7 @@ function Get-StateFromSessions {
     } catch { return $null }
 }
 
-# ---------------- 待审批操作：桌宠上直接放行 / 拒绝 ----------------
+# ---------------- 待审批操作：桌宠上直接同意 / 拒绝 ----------------
 # 插件端点 /kun-pet/state 的 pendingApprovals 列出等待确认的权限请求；
 # 点按钮把决策 POST 到 /kun-pet/approval（与 GUI 弹窗竞速，谁先操作听谁的）。
 # 两种情况只提示、不显示按钮（点了也送不出去，显示按钮只会误导）：
@@ -1348,7 +1349,7 @@ function Update-ApprovalPanel($dshSnap) {
         }
         $state.approvalItems = $items
         $state.approvalChannel = $channel
-        # answerable 缺省（老版本插件没有这个字段）＝ 还能在桌宠上答
+        # answerable 缺省（老版本插件没有这个字段）= 还能在桌宠上答
         $canAnswer = $true
         if ($items.Count -gt 0) {
             try { if ($null -ne $items[0].answerable) { $canAnswer = [bool]$items[0].answerable } } catch { $canAnswer = $true }
@@ -1376,7 +1377,7 @@ function Update-ApprovalPanel($dshSnap) {
             $state.lastApprovalAlertId = $firstId
             Play-Tones -freqs @(880, 1174.7, 880) -durMs 160 -gapMs 130
             try {
-                $hint = if ($channel -eq 'http' -and $canAnswer) { '可在桌宠上直接放行 / 拒绝：' } else { '请切回 Harness 窗口确认：' }
+                $hint = if ($channel -eq 'http' -and $canAnswer) { '可在桌宠上直接同意 / 拒绝：' } else { '请切回 Harness 窗口确认：' }
                 $notify.ShowBalloonTip(6000, '⚠ 需要你确认',
                     ($hint + [string]$first.toolName),
                     [System.Windows.Forms.ToolTipIcon]::Warning)
@@ -1795,11 +1796,11 @@ foreach ($preset in $script:sizePresets) {
 }
 $sizeMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
-$miScaleUp = [System.Windows.Forms.ToolStripMenuItem]::new('放大 (滚轮上)')
+$miScaleUp = [System.Windows.Forms.ToolStripMenuItem]::new('放大（滚轮上）')
 $miScaleUp.add_Click({ Set-Scale ([double]$state.scale + 0.1) $true })
 $sizeMenu.DropDownItems.Add($miScaleUp) | Out-Null
 
-$miScaleDown = [System.Windows.Forms.ToolStripMenuItem]::new('缩小 (滚轮下)')
+$miScaleDown = [System.Windows.Forms.ToolStripMenuItem]::new('缩小（滚轮下）')
 $miScaleDown.add_Click({ Set-Scale ([double]$state.scale - 0.1) $true })
 $sizeMenu.DropDownItems.Add($miScaleDown) | Out-Null
 
@@ -1838,7 +1839,7 @@ $script:gapPresets = @(
     @{ label = '标准'; value = -18 },
     @{ label = '稍远'; value = -12 },
     @{ label = '较远'; value = -6 },
-    @{ label = '默认'; value = -4 }
+    @{ label = '最远'; value = -4 }
 )
 $script:gapItems = @()
 foreach ($preset in $script:gapPresets) {
@@ -1852,10 +1853,10 @@ foreach ($preset in $script:gapPresets) {
     $gapMenu.DropDownItems.Add($item) | Out-Null
 }
 $gapMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
-$miGapCloser = [System.Windows.Forms.ToolStripMenuItem]::new('更近 (快捷)')
+$miGapCloser = [System.Windows.Forms.ToolStripMenuItem]::new('更近（快捷）')
 $miGapCloser.add_Click({ Set-Gap ([int]$state.gapPx - 3) $true })
 $gapMenu.DropDownItems.Add($miGapCloser) | Out-Null
-$miGapFarther = [System.Windows.Forms.ToolStripMenuItem]::new('更远 (快捷)')
+$miGapFarther = [System.Windows.Forms.ToolStripMenuItem]::new('更远（快捷）')
 $miGapFarther.add_Click({ Set-Gap ([int]$state.gapPx + 3) $true })
 $gapMenu.DropDownItems.Add($miGapFarther) | Out-Null
 $menu.Items.Add($gapMenu) | Out-Null
@@ -2008,7 +2009,7 @@ function Rebuild-PetMenu {
     for ($i = 0; $i -lt $script:pets.Count; $i++) {
         $pet = $script:pets[$i]
         $itemLabel = $pet.Name
-        # WebP 需要系统编解码器（Windows「Webp 图像扩展」）；探测失败时在菜单里标注
+        # WebP 需要系统编解码器（Windows「WebP 图像扩展」）；探测失败时在菜单里标注
         $probe = Load-PetSheet $i
         if (-not $probe) {
             $ext = [System.IO.Path]::GetExtension($pet.Sheet).ToLowerInvariant()
@@ -2059,7 +2060,7 @@ if ($savedPetId -and $savedPetId -ne 'none' -and $savedPetId -ne 'builtin') {
         }
         if ($fallback -ge 0) {
             Set-PetSelection $fallback $true
-            Write-Log ("saved pet '{0}' unavailable; using '{1}' now (saved preference kept for it to return)" -f $savedPetId, $script:pets[$fallback].Id)
+            Write-Log ("saved pet '{0}' unavailable; using '{1}' now (saved preference kept so it can be restored later)" -f $savedPetId, $script:pets[$fallback].Id)
             # 回退不覆盖用户原来的偏好：素材回来（重新安装 / 补上 WebP 扩展）后仍会恢复
             $state.petId = $savedPetId
             Save-Settings
@@ -2105,7 +2106,7 @@ $pollTimer.Add_Tick({
         # 注意：这里**不再**因为暂停而 return。暂停只冻结小宠的动画，
         # 任务气泡/进度/等待提示必须照常刷新（否则一暂停就什么都看不到了）。
         # 优先读会话投影缓存（始终可用），再退到插件端点，最后是活跃度兜底。
-        # 插件端点每次都读：它额外提供「待审批」列表（可在桌宠上直接放行/拒绝）
+        # 插件端点每次都读：它额外提供「待审批」列表（可在桌宠上直接同意/拒绝）
         $snap = Get-StateFromHarness
         $dshSnap = Get-StateFromDsh
         # 插件通道变化只记一行日志：这是「审批时气泡没提示」最关键的排查线索
@@ -2365,7 +2366,7 @@ $animTimer.Add_Tick({
             'harness'  { 'Harness 实时' }
             'dsh'      { 'DSH 插件接口' }
             'dsh-file' { 'DSH 插件快照文件' }
-            'sessions' { '会话活跃度(兜底)' }
+            'sessions' { '会话活跃度（兜底）' }
             default    { '未连接' }
         }
         $pauseLabel = ''
@@ -2519,7 +2520,7 @@ $window.Add_SizeChanged({
             $script:pendingPosH = 0.0
             $nl = [double]$window.Left + $adjW
             $nt = [double]$window.Top + $adjH
-            # 别把窗口还回到屏幕外（气泡长的时候底边可能超出工作区）
+            # 别把窗口还原到屏幕外（气泡长的时候底边可能超出工作区）
             $wa = [System.Windows.SystemParameters]::WorkArea
             if ($nl -lt $wa.Left) { $nl = $wa.Left }
             if ($nl + $w -gt $wa.Right) { $nl = $wa.Right - $w }

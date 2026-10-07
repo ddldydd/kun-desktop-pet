@@ -1,4 +1,4 @@
-"""校验 assets/pets 下每只素材的完整性。
+"""校验 assets/pets 下每份素材的完整性。
 
 检查项：
   1. pet.json 存在且是合法 JSON
@@ -49,7 +49,7 @@ def check_pet(pet_dir: str) -> list:
     sheet_name = meta.get("spritesheetPath") or "spritesheet.png"
     sheet_path = os.path.join(pet_dir, sheet_name)
     if not os.path.exists(sheet_path):
-        # 仓库内同时提供 png/webp，spritesheetPath 指向哪个都行，但必须存在
+        # 仓库内同时提供 png/webp，spritesheetPath 指向哪个都行，但必须存在。
         errors.append(f"{name}: pet.json 指向的 {sheet_name} 不存在")
         return errors
 
@@ -70,7 +70,7 @@ def check_pet(pet_dir: str) -> list:
             rows = candidate
             break
     if rows is None:
-        # 退一步：只要能被 9 或 11 整除就接受，并给出警告
+        # 退一步：只要能被 9 或 11 整除就接受，并给出警告。
         rows = next((c for c in ALLOWED_ROWS if h % c == 0), None)
         if rows is None:
             errors.append(f"{name}: 高度 {h} 不能被 9 或 11 整除")
@@ -81,8 +81,8 @@ def check_pet(pet_dir: str) -> list:
     print(f"  {name}: {w}x{h}  每格 {cw}x{ch}  {COLS}x{rows}")
 
     for r in range(rows):
-        cell = alpha.crop((0, r * ch, cw, (r + 1) * ch))
-        if cell.getbbox() is None:
+        row = alpha.crop((0, r * ch, w, (r + 1) * ch))
+        if row.getbbox() is None:
             errors.append(f"{name}: 第 {r + 1} 行整行全透明（空行）")
 
     for label, key in (("显示名", "displayName"), ("描述", "description")):
@@ -102,7 +102,7 @@ def main() -> int:
         print("assets/pets 下没有任何素材目录")
         return 1
 
-    print(f"检查 {len(pets)} 只素材:")
+    print(f"检查 {len(pets)} 份素材:")
     all_errors = []
     for pet in pets:
         all_errors += check_pet(os.path.join(ROOT, pet))

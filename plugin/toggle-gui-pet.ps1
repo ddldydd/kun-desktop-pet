@@ -1,4 +1,4 @@
-﻿<#
+<#
   Harness in-page pet - on/off switch (ASCII only, on purpose).
 
   What it does: toggles the pet overlay inside the Harness web UI
@@ -43,7 +43,7 @@ $sigOn  = "ctx.slots.inject('shell.overlay', () => ctx.slots.register("
 $sigOff = "ctx.slots.inject('shell.overlay', () => null);"
 
 # The registration call, in its original (pet visible) form. The live file
-# has this comment flush at column 0, so keep the here-string unindented.
+# has this call flush at column 0; the pattern below matches it verbatim.
 # (?s) is essential: in .NET regex, "." does not match a newline by default,
 # and this call spans three lines.
 $registerPattern = "(?s)" + [regex]::Escape($sigOn) + ".*?" + [regex]::Escape("KunPet,`n        ));")

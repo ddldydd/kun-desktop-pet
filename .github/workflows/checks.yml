@@ -73,7 +73,7 @@ jobs:
               Write-Host ("::error file=" + $_.FullName + "::含非 ASCII 字符但没有 UTF-8 BOM")
             }
           }
-          # 纯 ASCII 的脚本不需要 BOM；反过来，带 BOM 的也没问题
+          # 纯 ASCII 的脚本不需要 BOM；反过来，带 BOM 的也没问题。
           if ($fail -ne 0) { exit 1 }
 
       - name: Node 语法检查

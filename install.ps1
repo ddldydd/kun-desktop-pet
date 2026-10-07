@@ -216,7 +216,7 @@ if ($Start) {
     Write-Host "5) 启动桌宠" -ForegroundColor Cyan
     try {
         Start-Process -FilePath 'wscript.exe' -ArgumentList '//nologo', ('"' + $petVbs + '"')
-        Ok '桌宠已启动（没有立刻看到属正常，可能被其它窗口压住：按 Win+D 或右键菜单「重置位置」）'
+        Ok '桌宠已启动（没有立刻看到属正常，可能被其他窗口压住：按 Win+D 或右键菜单「重置位置」）'
     } catch {
         Warn ("启动失败: " + $_.Exception.Message)
         Info ('请手动双击: ' + $petVbs)
