@@ -81,6 +81,9 @@ jobs:
           node --check plugin/index.js
           node --check plugin/client.js
 
+      - name: 安装检查依赖
+        run: python3 -m pip install --quiet --disable-pip-version-check Pillow
+
       - name: 素材完整性（pet.json 可解析 + 精灵图尺寸）
         run: python3 docs/tools/verify-assets.py
 

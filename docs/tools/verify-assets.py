@@ -12,8 +12,6 @@ import json
 import os
 import sys
 
-from PIL import Image
-
 # Windows 控制台默认可能是 GBK，打印 ✓ / 中文会抛 UnicodeEncodeError。
 # 这里强制走 UTF-8，失败就退化成可替换字符，绝不让「打印」把检查结果搞崩。
 for _stream in (sys.stdout, sys.stderr):
@@ -21,6 +19,13 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - 依赖缺失时给出可操作的提示
+    print("缺少依赖 Pillow，无法检查精灵图尺寸。")
+    print("请先安装: python -m pip install Pillow")
+    sys.exit(2)
 
 COLS = 8
 ALLOWED_ROWS = (9, 11)
