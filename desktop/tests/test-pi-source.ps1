@@ -274,12 +274,74 @@ try {
     CheckTrue 'E: Get-PiHeader 能拿到记录' ($null -ne $hdr)
     Check 'E: Get-PiHeader 读到 cwd' $hdr.cwd 'E:\demo\big'
     Check 'E: Get-PiHeader 读到 id' $hdr.id '01a10000-0000-7000-8000-0000000000ee'
+
+    # --- 场景 F：同一目录开多个 pi 窗口 → **每个都要算一个任务** ---
+    #
+    # 这是回归测试：早先实现按 cwd 去重（为防子代理），结果同一项目目录下
+    # 多开 pi 只显示一个任务。正确做法是按「目录层级」排除子代理，而不是按 cwd 合并。
+    # 注意：这里必须换到**干净的独立目录**。前面场景在 $tmp 根下还留着 a.jsonl
+    # （场景 A 建的，一直在跑），直接复用 $tmp 会把它一起数进去 → 断言 3 却得到 4。
+    Reset-PiCompletionState
+    $multiRoot = Join-Path $tmp 'multiroot'
+    $multi = Join-Path $multiRoot 'proj'
+    New-Item -ItemType Directory -Force -Path $multi | Out-Null
+    Set-PiSourcePaths $multiRoot ([string]$oldInfo.stateFile)
+    # 三个会话，**同一个 cwd**，都在跑
+    for ($i = 1; $i -le 3; $i++) {
+        $src = Get-Content -LiteralPath (Join-Path $fixtures 'pi-running.jsonl') -Encoding UTF8
+        $src[0] = '{"type":"session","version":3,"id":"01a10000-0000-7000-8000-00000000000' + $i + '","timestamp":"2026-10-13T05:41:09.439Z","cwd":"E:\\demo\\same-project"}'
+        $p = Join-Path $multi ("w$i.jsonl")
+        Set-Content -LiteralPath $p -Value $src -Encoding UTF8
+        (Get-Item -LiteralPath $p).LastWriteTime = (Get-Date).AddSeconds(-5)
+    }
+    $snapMulti = Get-StateFromPiSessions
+    CheckTrue 'F: 同 cwd 三个窗口 → 拿到快照' ($null -ne $snapMulti)
+    Check 'F: 三个窗口都被算作任务' $snapMulti.runningAgents 3
+    Check 'F: 气泡说明有 3 个任务' $snapMulti.message '3 个 pi 任务进行中'
+    Check 'F: 逐条列出 3 行' @($snapMulti.progressLines).Count 3
+    # 同目录多窗口时每行要带项目名，否则三行看起来一模一样
+    CheckTrue 'F: 三行都带项目名以便区分' (@($snapMulti.progressLines | Where-Object { $_ -match 'same-project' }).Count -eq 3)
+
+    # --- 场景 G：子代理产物（更深层级）必须被排除 ---
+    #
+    # pi-subagents 的子会话写在 <会话目录>/subagent-artifacts/…（深一层），
+    # 或 <项目>/.pi/subagents/artifacts/（不在 sessions 根下）。
+    # 主会话段数恒为 2，所以按段数过滤能精确排除，且不影响多窗口。
+    Reset-PiCompletionState
+    # 本脚本里 Write-Log 是空实现（不收集日志），所以这里只断言「结果正确」；
+    # 「日志里记录了跳过」的断言放在 test-pi-integration.ps1（那边收集日志）。
+    $artDir = Join-Path $multi 'subagent-artifacts'
+    New-Item -ItemType Directory -Force -Path $artDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $fixtures 'pi-running.jsonl') -Destination (Join-Path $artDir 'run_worker.jsonl') -Force
+    (Get-Item -LiteralPath (Join-Path $artDir 'run_worker.jsonl')).LastWriteTime = (Get-Date).AddSeconds(-3)
+
+    $snapArt = Get-StateFromPiSessions
+    # 仍是 3 个（那 3 个主会话），子代理产物没被算进来
+    Check 'G: 子代理产物不计入任务数' $snapArt.runningAgents 3
+    # 恢复到 F 之前的路径，后面的清理与断言不受影响
+    Set-PiSourcePaths $tmp ([string]$oldInfo.stateFile)
 }
 finally {
     Set-PiSourcePaths ([string]$oldInfo.sessionsRoot) ([string]$oldInfo.stateFile)
     Reset-PiCompletionState
     Restore-PiCompletionState ([int64]$oldDone.at) $oldDone.summary
     try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+}
+
+Write-Host ""
+Write-Host "=== 4. 多窗口 / 子代理排除（纯函数级）===" -ForegroundColor Cyan
+# 直接验证「段数」判据本身（与模块内 $depth 的算法逐字一致）：
+#   主会话 = 根/转义cwd/文件                  → 2 段 → 不跳过
+#   子代理 = 根/转义cwd/subagent-artifacts/…  → ≥3 段 → 跳过
+$sessionsRootLen = 'E:\pi\agent\sessions'.Length
+foreach ($case in @(
+    @{ p = 'E:\pi\agent\sessions\--E--proj--\2026-01-01_a.jsonl';  want = 2 },
+    @{ p = 'E:\pi\agent\sessions\--E--proj--\subagent-artifacts\run-0\session.jsonl'; want = 4 }
+)) {
+    $rel = $case.p.Substring($sessionsRootLen).TrimStart('\','/')
+    $depth = @($rel -split '[\\/]').Count
+    Check ("段数判据: " + $rel) $depth $case.want
+    CheckTrue ("  该文件应" + $(if ($case.want -gt 2) { '被跳过' } else { '被保留' })) (($depth -gt 2) -eq ($case.want -gt 2))
 }
 
 Write-Host ""

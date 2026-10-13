@@ -73,6 +73,8 @@ $script:piCompletionAt = 0    # 最近一次「某会话刚收尾」的时间（
 $script:piCompletionSummary = $null
 $script:piMissingLogged = $false
 $script:piSchemaWarned = @{}
+# 上一帧「识别到的任务集合」签名，用于只在变化时打一行日志（排查多窗口问题）
+$script:piRunningSig = $null
 
 # ---------------- 配置入口（由主脚本调用） ----------------
 # 为什么用函数而不是让主脚本直接 `$script:piSessionsRoot = ...`：
@@ -498,10 +500,34 @@ function Get-StateFromPiSessions {
         $all = $root.GetFiles('*.jsonl', [System.IO.SearchOption]::AllDirectories)
         if ($null -eq $all -or $all.Length -eq 0) { return $null }
 
+        # ---- 精确排除子代理会话：**按目录层级**，而不是按 cwd 去重 ----
+        #
+        # pi-subagents 的子女会话**从不**直接写在 <sessions 根>/<转义cwd>/*.jsonl，
+        # 而是落在 artifacts 目录里（读过 pi-subagents 源码 + 本机实测确认）：
+        #   - artifactDir='session'（**默认**）→ <sessions根>/<转义cwd>/subagent-artifacts/…
+        #   - artifactDir='project'           → <项目>/.pi/subagents/artifacts/…（根本不在 sessions 下）
+        #   - artifactDir='temp'              → 系统临时目录
+        # 也就是说：**主会话的会话文件深度恒为 2**（根/项目目录/文件），
+        # 任何更深层的 .jsonl 都是子代理产物。按深度过滤既精确、又零代价。
+        #
+        # 这里刻意**不再**按 cwd 去重 —— 那是我最初的错误做法：它会把「同一项目目录下
+        # 开了多个 pi 窗口」误判成子代理，只显示一个任务。多窗口恰恰是常见用法。
+        $sessionFiles = New-Object System.Collections.ArrayList
+        foreach ($f in $all) {
+            $rel = $f.FullName.Substring($script:piSessionsRoot.Length).TrimStart('\', '/')
+            $depth = @($rel -split '[\\/]').Count      # 根/目录/文件 = 3 段 → 深度 2
+            if ($depth -gt 2) {
+                Write-Log ('pi source: skipped nested session file (likely subagent artifact): {0}' -f $rel)
+                continue
+            }
+            [void]$sessionFiles.Add($f)
+        }
+        if ($sessionFiles.Count -eq 0) { return $null }
+
         # 候选：最近 piCandidateSec 内写过的 + 之前跟踪中的（保证收尾下降沿能被观测到）
         $now = Get-Date
         $candidates = New-Object System.Collections.ArrayList
-        foreach ($f in $all) {
+        foreach ($f in $sessionFiles) {
             $ageSec = ($now - $f.LastWriteTime).TotalSeconds
             $tracked = $false
             try { $tracked = $script:piRunPrev.ContainsKey([string]$f.Name) } catch { }
@@ -511,11 +537,12 @@ function Get-StateFromPiSessions {
         }
         if ($candidates.Count -eq 0) { return $null }
 
-        # 只处理最新的若干会话，避免历史会话拖慢轮询
-        $ordered = @($candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 12)
+        # 只处理最新的若干会话，避免历史会话拖慢轮询。
+        # 上限从 12 提到 24：多窗口场景下「同时在跑的 pi」很容易超过 12 个，
+        # 截断会让最新的窗口挤掉别的活跃窗口（表现为「有的窗口不显示」）。
+        $ordered = @($candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 24)
 
-        # (a) 先把候选会话全部求值（含逐会话下降沿），(b) 再做聚合与去重。
-        # 分两步是为了在去重时能看到「同 cwd 的其它会话」，而不是边走边判。
+        # (a) 先把候选会话全部求值（含逐会话下降沿），(b) 再聚合。
         $seen = New-Object System.Collections.ArrayList
         $seenIds = @{}
         $anyFresh = $false
@@ -568,41 +595,21 @@ function Get-StateFromPiSessions {
             })
         }
 
-        # (b) 子代理去重（Phase 1 兜底；Phase 2 装上扩展后由扩展给权威 sessionId）
+        # (b) 每个正在跑的会话都算一个任务 —— **不做** cwd 合并。
         #
-        # pi 会话头里**没有** parentSessionId（本机 36 个文件实测 0 命中），而
-        # pi-subagents 的子女会话默认也写进同一个 sessions 目录，且干活时写得更频繁。
-        # 所以**不能**用「取最新一个」去重 —— 那正好会优先选中子代理（方向反了）。
-        # 这里改用两个更稳的特征，按优先级：
-        #   ① userTurns 多的更像主会话（子代理通常只有一个由父会话生成的合成 prompt）；
-        #   ② 同分时取**开始得更早**的（父会话一定先于子会话创建）。
-        # 仍然只是启发式：命中不了也不会错到离谱（最坏是子代理进展被当主任务显示）。
+        # 子代理已经在上面按「目录层级」精确排除了，所以这里不需要（也不应该）
+        # 再按 cwd 去重：同一项目目录下开多个 pi 窗口是完全正常的用法，
+        # 每个窗口都是一个独立任务，必须都显示出来。
+        # （早先版本按 cwd 只保留一个，导致「多开 pi 只认得到一个任务」，已修。）
         $runningAll = @($seen | Where-Object { $_.running })
-        $byCwd = @{}
-        foreach ($s in $runningAll) {
-            $key = $s.cwd
-            if (-not $key) { $key = '__nocwd__' + [string]$s.id }
-            if (-not $byCwd.ContainsKey($key)) { $byCwd[$key] = @() }
-            $byCwd[$key] += $s
-        }
         $runningSessions = New-Object System.Collections.ArrayList
-        foreach ($key in @($byCwd.Keys)) {
-            $group = @($byCwd[$key])
-            $chosen = $group[0]
-            if ($group.Count -gt 1) {
-                # 排序键用「负值」表达降序：避免在 Sort-Object 上写两行反引号续行
-                # （反引号续行对行尾空白很敏感，是这类脚本常见的隐蔽语法坑）。
-                $ranked = @($group | Sort-Object { -1 * [int]$_.parsed.userTurns }, { -1 * [double]$_.ageSec })
-                $chosen = $ranked[0]
-                $skipped = @($ranked | Select-Object -Skip 1 | ForEach-Object { $_.id })
-                Write-Log ('pi source: same cwd has {0} running sessions; using {1}, ignoring {2} (possible subagents)' -f
-                           $group.Count, $chosen.id, ($skipped -join ','))
-            }
+        foreach ($chosen in $runningAll) {
             # 气泡优先用「有意义的最近一条」：pi 里用户常只回 "可以" / "+" / "继续"，
             # 直接显示那条对用户毫无信息量。只有在没有更有意义的输入时才退回它。
             $shownPrompt = [string]$chosen.parsed.lastPromptMeaningful
             if (-not $shownPrompt) { $shownPrompt = [string]$chosen.parsed.lastPrompt }
             [void]$runningSessions.Add(@{
+                id     = $chosen.id
                 cwd    = $chosen.cwd
                 prompt = $shownPrompt
                 turns  = [int]$chosen.parsed.userTurns
@@ -612,6 +619,14 @@ function Get-StateFromPiSessions {
                 reason = $chosen.reason
                 ageSec = $chosen.ageSec
             })
+        }
+        # 同一目录多窗口时，气泡里加项目名区分（否则几行看起来一模一样，分不清哪个是哪个）
+        $cwdCount = @{}
+        foreach ($r in $runningSessions) {
+            $k = [string]$r.cwd
+            if (-not $k) { $k = '?' }
+            if (-not $cwdCount.ContainsKey($k)) { $cwdCount[$k] = 0 }
+            $cwdCount[$k]++
         }
 
         # ---- 汇总（只在被选中的会话上统计，避免把子代理的数字算进主任务）----
@@ -653,6 +668,25 @@ function Get-StateFromPiSessions {
         # 全部会话都已收尾，且缓冲里有「刚刚」发生的一次完成
         $nowMs = [int64]((Get-Date).ToUniversalTime() - $script:epochRef).TotalMilliseconds
         $doneRecent = ($script:piCompletionAt -gt 0 -and ($nowMs - $script:piCompletionAt) -lt ($script:piRecentDoneSec * 1000))
+
+        # 只在「识别到的任务集合」变化时打一行日志。
+        # 必须放在下面那个 idle 提前 return **之前**，否则「任务数变成 0」这条最关键
+        # 的转变不会被记录（排查「多开 pi 只显示一个」时正需要看每次集合变化）。
+        try {
+            $sig = (@($runningSessions | ForEach-Object { ([string]$_.id) + '@' + ([string]$_.cwd) }) -join '|')
+            if ($sig -ne $script:piRunningSig) {
+                $script:piRunningSig = $sig
+                if ($runningSessions.Count -gt 0) {
+                    $ids = @($runningSessions | ForEach-Object {
+                        $s = [string]$_.id
+                        $s.Substring(0, [Math]::Min(8, $s.Length))
+                    })
+                    Write-Log ('pi source: {0} running task(s) [{1}]' -f $runningSessions.Count, ($ids -join ', '))
+                } else {
+                    Write-Log 'pi source: no running tasks'
+                }
+            }
+        } catch { }
 
         if ($runningSessions.Count -eq 0 -and -not $doneRecent -and -not $anyFresh) {
             # 没有在跑、也没有刚收尾 → 这个源此刻没有可报告的东西。
@@ -721,12 +755,22 @@ function Get-StateFromPiSessions {
             } else {
                 $message = '{0} 个 pi 任务进行中' -f $runningCount
                 foreach ($r in $runningSessions) {
-                    $line = '· [pi] ' + (Limit-Text ([string]$r.prompt) 34) +
-                            ('（{0} 轮 / {1} 步）' -f [int]$r.turns, [int]$r.steps)
+                    $line = '· [pi] ' + (Limit-Text ([string]$r.prompt) 34)
+                    # 同一目录开了多个窗口时，几行会长得一模一样，分不清哪个是哪个。
+                    # 这种情况给每行补一个项目名（取路径最后一段）作区分。
+                    $cwdKey = [string]$r.cwd
+                    if (-not $cwdKey) { $cwdKey = '?' }
+                    if ($cwdCount[$cwdKey] -gt 1 -and $r.cwd) {
+                        $proj = Split-Path -Leaf ([string]$r.cwd)
+                        if ($proj) { $line += ('〔' + (Limit-Text $proj 16) + '〕') }
+                    }
+                    $line += ('（{0} 轮 / {1} 步）' -f [int]$r.turns, [int]$r.steps)
                     $progressLines += $line
                 }
-                if ($progressLines.Count -gt 3) {
-                    $progressLines = @($progressLines[0..2])
+                # 上限从 3 提到 5：多开 pi 时前 3 条会把后面的窗口全遮掉。
+                # 折叠行里保留总数，保证「有几个任务」永远看得见。
+                if ($progressLines.Count -gt 5) {
+                    $progressLines = @($progressLines[0..4])
                     $progressLines += ('… 共 {0} 个 pi 任务进行中' -f $runningCount)
                 }
             }
@@ -736,6 +780,8 @@ function Get-StateFromPiSessions {
         }
 
         if ($compacting) { $progressLines = @($progressLines) + @('（pi 正在压缩上下文）') }
+
+        # （任务集合变化日志已在上面的 idle 提前 return 之前统一输出，这里不再重复）
 
         $modeWeight = 5
         if ($mode -eq 'waiting') { $modeWeight = 1 }

@@ -288,17 +288,37 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallPiExte
 
 若长期卡住，检查日志里 `pi channel:` 是否在反复跳通道。
 
+### 同一目录开了多个 pi 窗口，桌宠只显示一个任务
+
+**这是曾经的一个 bug，已修复。** 原因是早期实现为了排除子代理，按「同一 cwd 只保留一个
+会话」，于是把同目录的多个 pi 窗口误当成子代理合并了。
+
+现在的做法：子代理按**目录层级**精确排除（子会话产物在 `subagent-artifacts/` 等更深层，
+主会话恒定在 `<转义cwd>/*.jsonl`），**不再**按 cwd 合并 —— 每个窗口都是一个独立任务。
+
+若升级后仍只看到一个，检查：
+
+1. 是否真的在跑的只有一个？看日志里这行（每次任务集合变化都会记录）：
+
+   ```
+   pi source: 3 running task(s) [01a1343b, 01a1343c, 01a1343d]
+   ```
+
+   只列出 1 个 id，就说明另一个窗口确实已经空闲（不是被合并）。
+2. 超过 24 个会话时只跟踪最新的 24 个 —— 极端多开时较早的会被截掉。
+3. 气泡一次最多逐条列 5 个，超出折叠成「… 共 N 个 pi 任务进行中」（总数仍在）。
+
 ### 同时装了 pi-subagents，桌宠把子代理显示成主任务
 
-pi 的会话头里没有 `parentSessionId`，所以只能启发式去重：**同一 cwd 下多个会话
-同时在跑时，保留「用户轮次最多」的那个**。日志里出现下面这行说明它在过滤：
+子代理产物写在更深的目录里（默认 `<转义cwd>/subagent-artifacts/…`，或
+`<项目>/.pi/subagents/…`），桌宠按目录层级排除。日志里出现下面这行说明它在过滤：
 
 ```
-pi source: same cwd has 2 running sessions; using <主会话id>, ignoring <子会话id> (possible subagents)
+pi source: skipped nested session file (likely subagent artifact): <相对路径>
 ```
 
-如果仍然认错，临时办法是把这个项目的 `cwd` 分开跑，或等扩展通道生效（扩展给的
-`sessionId` 更权威）。
+如果子代理仍被当成主任务显示，请附上那行日志 —— 说明该版本的 `pi-subagents` 换了
+存放位置，需要把新路径加进过滤规则。
 
 ### 担心 pi 的 API Key 被读走
 
@@ -343,7 +363,7 @@ try { Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | ConvertTo-Json -D
 Get-Content "$env:USERPROFILE\.dsh\kun-pet-host.log" -Tail 30 -ErrorAction SilentlyContinue
 
 # pi 通道
-Select-String -Path .\kun-pet-desktop.log -Pattern 'pi source|pi channel|same cwd' | Select-Object -Last 20
+Select-String -Path .\kun-pet-desktop.log -Pattern 'pi source|pi channel|running task|no running|skipped nested' | Select-Object -Last 20
 Get-Content "$env:USERPROFILE\.pi\agent\kun-pet-state.json" -Raw -ErrorAction SilentlyContinue
 (Get-ChildItem "$env:USERPROFILE\.pi\agent\sessions" -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Descending | Select-Object -First 5 Name, LastWriteTime)

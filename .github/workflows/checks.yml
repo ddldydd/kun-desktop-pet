@@ -84,12 +84,15 @@ jobs:
       - name: pi 源适配器自测（夹具 + 接入层）
         shell: pwsh
         run: |
-          # 这两套都不需要真的装 pi、也不需要起桌宠：只读夹具与系统临时目录。
-          # 覆盖「toolCall/toolResult 配平判定」「多源仲裁」「过期快照」「大文件截断」等。
+          # 这几套都不需要真的装 pi、也不需要起桌宠：只读夹具与系统临时目录。
+          # 覆盖「toolCall/toolResult 配平判定」「多源仲裁」「多窗口（同目录多个 pi）」
+          # 「子代理产物按目录层级排除」「过期快照」「大文件截断」等。
           $fail = 0
           & ./desktop/tests/test-pi-source.ps1
           if ($LASTEXITCODE -ne 0) { $fail = 1 }
           & ./desktop/tests/test-pi-integration.ps1
+          if ($LASTEXITCODE -ne 0) { $fail = 1 }
+          & ./desktop/tests/test-pi-multiwindow.ps1 -Windows 3
           if ($LASTEXITCODE -ne 0) { $fail = 1 }
           if ($fail -ne 0) { exit 1 }
 

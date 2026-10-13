@@ -169,9 +169,44 @@ try {
     $piStale = Get-StateFromPiExtension
     Check '过期快照 → $null（不采信）' $(if ($null -eq $piStale) { 'null' } else { 'snap' }) 'null'
 
-    # ---- 6. 关掉开关后必须彻底不工作 ----
+    # ---- 6. 多窗口：同一目录多个 pi 必须都是独立任务（回归）----
     Write-Host ""
-    Write-Host "=== 6. 关掉 pi 开关 ===" -ForegroundColor Cyan
+    Write-Host "=== 6. 同一目录多开 pi（回归：曾经只认得到一个）===" -ForegroundColor Cyan
+    $multiRoot = Join-Path $tmp 'multiroot'
+    $multiDir = Join-Path $multiRoot 'proj'
+    New-Item -ItemType Directory -Force -Path $multiDir | Out-Null
+    Set-PiSourcePaths $multiRoot (Join-Path $tmp 'no-such-state.json')
+    Reset-PiCompletionState
+    for ($i = 1; $i -le 4; $i++) {
+        $src = Get-Content -LiteralPath (Join-Path $fixtures 'pi-running.jsonl') -Encoding UTF8
+        $src[0] = '{"type":"session","version":3,"id":"01a1e2e2-0000-7000-8000-00000000000' + $i + '","timestamp":"2026-10-13T05:41:09.439Z","cwd":"E:\\demo\\shared"}'
+        $p = Join-Path $multiDir ("w$i.jsonl")
+        Set-Content -LiteralPath $p -Value $src -Encoding UTF8
+        (Get-Item -LiteralPath $p).LastWriteTime = (Get-Date).AddSeconds(-5)
+    }
+    $snapW = Get-StateFromPi
+    CheckTrue '多窗口：拿到快照' ($null -ne $snapW)
+    Check '多窗口：4 个窗口 = 4 个任务' $snapW.runningAgents 4
+    Check '多窗口：气泡列出 4 行' @($snapW.progressLines).Count 4
+    CheckTrue '多窗口：每行带项目名区分' (@($snapW.progressLines | Where-Object { $_ -match 'shared' }).Count -eq 4)
+
+    # ---- 7. 子代理产物必须排除，且日志留痕 ----
+    Write-Host ""
+    Write-Host "=== 7. 子代理产物按目录层级排除 ===" -ForegroundColor Cyan
+    Reset-PiCompletionState
+    $script:logLines.Clear()
+    $artDir = Join-Path $multiDir 'subagent-artifacts'
+    New-Item -ItemType Directory -Force -Path $artDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $fixtures 'pi-running.jsonl') -Destination (Join-Path $artDir 'run_worker.jsonl') -Force
+    (Get-Item -LiteralPath (Join-Path $artDir 'run_worker.jsonl')).LastWriteTime = (Get-Date).AddSeconds(-3)
+    $snapSub = Get-StateFromPi
+    Check '子代理产物不计入任务数（仍为 4）' $snapSub.runningAgents 4
+    CheckTrue '日志记录了跳过的嵌套会话' ((@($script:logLines) -join "`n") -match 'subagent artifact|skipped nested')
+    Set-PiSourcePaths $tmp (Join-Path $tmp 'no-such-state.json')
+
+    # ---- 8. 关掉开关后必须彻底不工作 ----
+    Write-Host ""
+    Write-Host "=== 8. 关掉 pi 开关 ===" -ForegroundColor Cyan
     Set-PiEnabled $false
     Check '关掉后 Get-StateFromPi = $null' $(if ($null -eq (Get-StateFromPi)) { 'null' } else { 'snap' }) 'null'
     Set-PiEnabled $true

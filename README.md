@@ -355,7 +355,22 @@ Copy-Item .\pi-extension\kun-pet.ts $dest -Force
 | 只有进展、没有「等你确认」 | 正常 —— 这一项**必须**装扩展（见上）。装了扩展后日志应出现 `pi channel: ext` |
 | 装了扩展但仍是 `pi channel: sessions` | 扩展没生效：在 pi 里 `/reload`；确认文件在 `~/.pi/agent/extensions/kun-pet.ts` |
 | pi 状态卡在「进行中」不消失 | 看日志有没有 `pi channel: …` 反复跳。正常情况下 pi 一轮结束会转成「任务结束」；若 pi 被强杀，快照/会话文件不再更新，桌宠会在 30s（扩展）/180s（会话）后自动回落待机 |
-| 同时装了 `pi-subagents` | 子代理会话与主会话写在同一个目录。桌宠**按 cwd 去重**（优先保留用户轮次多的那个）来尽量避免把子代理显示成主任务；日志里会出现 `same cwd has N running sessions; using …` 说明它在过滤 |
+| 同时装了 `pi-subagents` | 子代理产物写在 **`subagent-artifacts/` 子目录**里（或多在 `<项目>/.pi/subagents/`），而主会话恒定在 `<转义cwd>/*.jsonl`。桌宠**按目录层级**精确排除，不影响多窗口。日志里出现 `skipped nested session file` 说明它在过滤 |
+
+### 同一目录开多个 pi 窗口
+
+**每个窗口都是一个独立任务**，会全部显示出来（不会被合并成一个）：
+
+```
+· [pi] 修登录 bug〔myproj〕（2 轮 / 5 步）
+· [pi] 补 README〔myproj〕（1 轮 / 3 步）
+```
+
+- 同一目录多窗口时，每行会补一个**项目名**（路径最后一段）以便区分
+- 一次最多逐条列出 5 个，超出折叠为「… 共 N 个 pi 任务进行中」（总数始终可见）
+- 一次最多跟踪 24 个会话（多开时不会被最新的挤掉旧的）
+- 排查用:日志里每次「识别到的任务集合」变化都会记一行
+  （`pi source: 3 running task(s) [01a1343b, …]` / `pi source: no running tasks`）
 
 > pi 的「等你」和 DSH 的「审批」**不是一回事**：pi 那边来自它自己的确认框/选择框，
 > 只能在 pi 窗口里回答，桌宠**不会**（也没有能力）替你点同意。所以横幅写的是
