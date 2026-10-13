@@ -5,11 +5,13 @@
     1. 把 desktop/ 下的桌宠本体复制到安装目录（默认 %USERPROFILE%\kun-desktop-pet）
     2. 把 assets/pets/ 下的形象素材装到 ~/.petdex/pets/（已存在则不覆盖）
     3. 可选：安装 DSH 插件 @local/kun-pet（需要 -InstallPlugin）
-    4. 可选：注册开机自启（需要 -Autostart）
+    4. 可选：安装 pi 扩展（需要 -InstallPiExtension），让桌宠也能跟随 pi coding agent
+    5. 可选：注册开机自启（需要 -Autostart）
 
   用法：
     powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
     powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Autostart -InstallPlugin
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallPiExtension
     powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Target D:\pets\kun -Start
 
   说明：本脚本只用 Windows 自带的 PowerShell 5.1 功能，不依赖任何第三方模块。
@@ -27,6 +29,9 @@ param(
 
     # 插件装到哪个 DSH profile
     [string]$Profile = 'desktop',
+
+    # 安装 pi coding agent 扩展（让桌宠能收到「pi 正在等你确认」等精确状态）
+    [switch]$InstallPiExtension,
 
     # 注册开机自启
     [switch]$Autostart,
@@ -57,6 +62,7 @@ $srcDesktop = Join-Path $repo 'desktop'
 $srcAssets = Join-Path $repo 'assets\pets'
 $srcPlugin = Join-Path $repo 'plugin'
 $srcAuto = Join-Path $repo 'tools\autostart'
+$srcPiExt = Join-Path $repo 'pi-extension'
 
 if (-not (Test-Path (Join-Path $srcDesktop 'kun-pet-desktop.ps1'))) {
     Die ("没找到 desktop\kun-pet-desktop.ps1 —— 请在仓库根目录运行本脚本（当前: " + $repo + "）")
@@ -185,6 +191,40 @@ if (-not $InstallPlugin) {
 
         Warn 'profile 只在 DSH 启动时读取一次：请重启一次 DSH，插件才会生效。'
         Info '重启后可自查: Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state'
+    }
+}
+
+# ---------------- 3.5 pi coding agent 扩展（可选） ----------------
+Write-Host ""
+Write-Host "3.5) pi coding agent 扩展" -ForegroundColor Cyan
+
+if (-not $InstallPiExtension) {
+    Info '未安装（需要时加 -InstallPiExtension）。'
+    Info '不装也能跟随 pi：桌宠会只读 pi 的会话文件，覆盖「在干活 / 收尾 / 出错」。'
+    Info '装了才补上「pi 正在等你确认」——这一项会话文件里没有，只有扩展能提供。'
+} else {
+    # pi 的扩展目录：~/.pi/agent/extensions/（与 model-config.ts 等扩展同目录）
+    $piExtDir = Join-Path $env:USERPROFILE '.pi\agent\extensions'
+    $piAgentDir = Join-Path $env:USERPROFILE '.pi\agent'
+
+    if (-not (Test-Path $srcPiExt)) {
+        Warn ("仓库里没有 pi-extension 目录，跳过: " + $srcPiExt)
+    } elseif (-not (Test-Path $piAgentDir)) {
+        Warn ("没找到 pi 的配置目录: " + $piAgentDir)
+        Warn '先装好 pi 并至少运行一次（会生成 ~/.pi/agent），再回来执行本步。扩展未安装。'
+    } else {
+        if (-not (Test-Path $piExtDir)) { New-Item -ItemType Directory -Force -Path $piExtDir | Out-Null }
+        $extDest = Join-Path $piExtDir 'kun-pet.ts'
+        if ((Test-Path $extDest) -and -not $Force) {
+            Warn ("已存在，未覆盖: " + $extDest + "（要覆盖请加 -Force）")
+        } else {
+            Copy-Item -LiteralPath (Join-Path $srcPiExt 'kun-pet.ts') -Destination $extDest -Force
+            Ok ("pi 扩展已装: " + $extDest)
+        }
+        Info '在 pi 里执行 /reload 让扩展生效（或重开 pi）。'
+        Info ('状态文件会写在: ' + (Join-Path $piAgentDir 'kun-pet-state.json'))
+        Info '桌宠日志里出现 "pi channel: ext" 就说明扩展通道生效了。'
+        Info '卸载：删掉上面那个 kun-pet.ts 即可（桌宠会自动退回会话文件通道）。'
     }
 }
 

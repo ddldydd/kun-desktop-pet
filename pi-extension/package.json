@@ -1,0 +1,14 @@
+{
+  "name": "kun-pet-pi-extension",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Kun Like 桌宠 × pi coding agent：把 pi 的运行时状态（尤其是「正在等你确认」）发布给桌面桌宠",
+  "license": "MIT",
+  "pi": {
+    "extension": "./kun-pet.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.2.0"
+  }
+}

@@ -81,6 +81,18 @@ jobs:
           node --check plugin/index.js
           node --check plugin/client.js
 
+      - name: pi 源适配器自测（夹具 + 接入层）
+        shell: pwsh
+        run: |
+          # 这两套都不需要真的装 pi、也不需要起桌宠：只读夹具与系统临时目录。
+          # 覆盖「toolCall/toolResult 配平判定」「多源仲裁」「过期快照」「大文件截断」等。
+          $fail = 0
+          & ./desktop/tests/test-pi-source.ps1
+          if ($LASTEXITCODE -ne 0) { $fail = 1 }
+          & ./desktop/tests/test-pi-integration.ps1
+          if ($LASTEXITCODE -ne 0) { $fail = 1 }
+          if ($fail -ne 0) { exit 1 }
+
       - name: 安装检查依赖
         run: python3 -m pip install --quiet --disable-pip-version-check Pillow
 

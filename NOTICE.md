@@ -36,13 +36,24 @@
 - **DeepSeek Harness（DSH）**：`plugin/` 目录是面向 DSH 的插件，`desktop/` 能读取 DSH 的会话状态。
   DSH 及其相关包归其各自作者所有，本仓库不包含、也不分发它们。
 - 桌宠本身**不依赖** DSH 即可运行。
+- **pi coding agent**（`@earendil-works/pi-coding-agent`，作者 Mario Zechner，MIT，
+  仓库 `github.com/earendil-works/pi`）：`pi-extension/` 是面向 pi 的扩展，
+  `desktop/kun-pet-pi-source.ps1` 会只读 pi 的会话文件。pi 及其相关包归其各自作者所有，
+  本仓库**不包含、也不分发**它们（扩展只通过 pi 公开的 `ExtensionAPI` 类型做类型引用，
+  运行时不打包 pi 本身）。
+
+> 桌宠读取 pi 数据时**只读** `~/.pi/agent/sessions/` 与扩展自己写的 `kun-pet-state.json`；
+> **绝不**读取 `models.json` / `auth.json` / `secrets.dpapi.json`（那些文件含明文 API Key）。
 
 ---
 
 ## 4. 本仓库作者原创部分
 
 - `desktop/kun-pet-desktop.ps1` —— 桌面桌宠本体（WPF 渲染、状态机、素材加载、气泡、托盘、审批面板等）
+- `desktop/kun-pet-pi-source.ps1` —— pi coding agent 源适配器（只读尾随 + 扩展快照 + 多源仲裁）
+- `desktop/tests/` —— pi 源适配器的夹具与自测脚本
 - `plugin/index.js`、`plugin/client.js` —— DSH 插件（host 状态机 / 端点 / 审批应答；网页端小宠渲染）
+- `pi-extension/kun-pet.ts` —— pi 扩展（状态快照发布）
 - `install.ps1`、`uninstall.ps1`、`plugin/toggle-gui-pet.ps1` 等脚本
 - `docs/` 下的文档
 

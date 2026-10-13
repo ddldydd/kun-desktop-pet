@@ -8,6 +8,7 @@
   其他东西默认不动，需要时显式加开关：
     -RemoveAssets      删掉 ~/.petdex/pets 下由本仓库自带的素材（ikkun / haiyue-classic）
     -RemovePlugin      删掉 DSH profile 里的 @local/kun-pet 插件与 cordis.patch.yml 里的 insert
+    -RemovePiExtension 删掉 pi 扩展 ~/.pi/agent/extensions/kun-pet.ts 与它的状态快照文件
     -RemoveAutostart   删掉「启动」文件夹里的 KunPet-autostart.cmd 与 KunPet-pet-running.ps1
     -KeepFiles         只结束进程，不删安装目录
 
@@ -20,6 +21,7 @@ param(
     [string]$Target = (Join-Path $env:USERPROFILE 'kun-desktop-pet'),
     [switch]$RemoveAssets,
     [switch]$RemovePlugin,
+    [switch]$RemovePiExtension,
     [string]$Profile = 'desktop',
     [switch]$RemoveAutostart,
     [switch]$KeepFiles
@@ -141,9 +143,29 @@ if (-not $RemovePlugin) {
     }
 }
 
-# ---------------- 5. 开机自启 ----------------
+# ---------------- 5. pi coding agent 扩展 ----------------
 Write-Host ""
-Write-Host "5) 开机自启" -ForegroundColor Cyan
+Write-Host "5) pi coding agent 扩展" -ForegroundColor Cyan
+if (-not $RemovePiExtension) {
+    Info '未删除（需要时加 -RemovePiExtension）'
+} else {
+    $piAgent = Join-Path $env:USERPROFILE '.pi\agent'
+    $extFile = Join-Path $piAgent 'extensions\kun-pet.ts'
+    $stateFile = Join-Path $piAgent 'kun-pet-state.json'
+
+    if (Test-Path $extFile) { Remove-Item -LiteralPath $extFile -Force; Ok ("已删除 pi 扩展 " + $extFile) }
+    else { Info ("pi 扩展不存在，跳过: " + $extFile) }
+
+    # 状态快照也一并清掉：否则桌宠可能读到最后一次留下的陈旧内容
+    if (Test-Path $stateFile) { Remove-Item -LiteralPath $stateFile -Force; Ok ("已删除状态快照 " + $stateFile) }
+    else { Info ("状态快照不存在，跳过: " + $stateFile) }
+
+    Info 'pi 里执行 /reload（或重开）后扩展即卸载；桌宠会自动退回「只读会话文件」通道。'
+}
+
+# ---------------- 6. 开机自启 ----------------
+Write-Host ""
+Write-Host "6) 开机自启" -ForegroundColor Cyan
 if (-not $RemoveAutostart) {
     Info '未删除（需要时加 -RemoveAutostart）'
 } else {

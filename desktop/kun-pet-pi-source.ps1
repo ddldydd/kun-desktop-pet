@@ -1,0 +1,911 @@
+﻿# =====================================================================
+#  Kun Like 桌宠 · pi coding agent 源适配器
+# =====================================================================
+#  目的：让桌宠把 pi（@earendil-works/pi-coding-agent）的任务进展当作一等数据源，
+#        产出与 DSH 路径**完全相同形状**的归一化快照，从而复用现有的动画/气泡/
+#        提醒/多任务展示逻辑，一行渲染代码都不用改。
+#
+#  两条通道（自动降级，与 DSH 侧的「插件 HTTP → 插件文件 → 投影缓存」同构）：
+#    1) 扩展状态文件  ~/.pi/agent/kun-pet-state.json          【精确，需装 pi 扩展】
+#       —— 唯一能可靠表达「pi 正在等你确认」的来源（ui_prompt_start 事件）。
+#    2) 会话 JSONL    ~/.pi/agent/sessions/<转义cwd>/*.jsonl   【零安装，只读尾随】
+#       —— 覆盖「在干活 / 收尾 / 出错 / 模型 / 轮次步骤」。
+#
+#  设计约束：
+#    - fail-soft：pi 没装、目录不存在、JSON 坏行、schema 升版，一律静默降级，
+#      绝不影响 DSH 侧表现，也绝不抛异常打断 500ms 轮询。
+#    - 只读：**永不写** pi 目录。特别注意绝不打开 models.json / auth.json /
+#      secrets.dpapi.json —— 那里是明文 API Key，日志里也只允许出现 provider 名与 modelId。
+#    - 零依赖：纯 PowerShell 5.1 + .NET Framework。
+#    - 性能：会话文件可能很大（单行含大段工具输出）。因此
+#      ① 只回读文件尾部窗口；② 按 (mtime, length) 缓存解析结果，
+#      文件没变就完全不重新解析（正常轮询每轮只解析 0~1 个文件）。
+#
+#  被 kun-pet-desktop.ps1 以 dot-source 方式加载；也可被自测脚本单独加载。
+# =====================================================================
+
+# ---------------- 依赖兜底：单独加载（自测）时不至于报错 ----------------
+# 主脚本已定义同名函数时不会被覆盖（dot-source 到主脚本作用域，Get-Command 能找到）。
+if (-not (Get-Command -Name 'Write-Log' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Write-Log([string]$msg) { }
+}
+if (-not (Get-Command -Name 'Limit-Text' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Limit-Text([string]$text, [int]$max) {
+        if (-not $text) { return '' }
+        $t = ($text -replace '\s+', ' ').Trim()
+        if ($t.Length -le $max) { return $t }
+        return $t.Substring(0, $max) + '…'
+    }
+}
+if (-not (Get-Command -Name 'Note-TickError' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Note-TickError([string]$where, $err) { }
+}
+if (-not (Get-Command -Name 'Get-EpochMs' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Get-EpochMs { return [int64]((Get-Date).ToUniversalTime() - $script:epochRef).TotalMilliseconds }
+}
+if (-not $script:epochRef) {
+    $script:epochRef = [System.DateTime]::new(1970, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)
+}
+
+# ---------------- 配置（主脚本的 Load-Settings 可覆盖） ----------------
+if (-not $script:piSessionsRoot) {
+    $script:piSessionsRoot = Join-Path $env:USERPROFILE '.pi\agent\sessions'
+}
+if (-not $script:piStateFile) {
+    $script:piStateFile = Join-Path $env:USERPROFILE '.pi\agent\kun-pet-state.json'
+}
+# 扩展状态文件的新鲜度窗口（扩展每 5s 心跳重写一次）
+if (-not $script:piStateFileFreshSec) { $script:piStateFileFreshSec = 30 }
+# 每个会话只回读尾部这么多字节：足够判定「在跑 / 刚收尾」
+if (-not $script:piTailBytes) { $script:piTailBytes = 262144 }
+# 会话年龄超过这个值就不再当「在跑」（容忍长时间思考时不写盘的情况）
+if (-not $script:piFreshSec) { $script:piFreshSec = 180 }
+# 候选会话的年龄上限（与 DSH 侧一致：15 分钟内写过）
+if (-not $script:piCandidateSec) { $script:piCandidateSec = 900 }
+# 「刚出错」「刚收尾」的提醒窗口（与主脚本 Update-Alerts 的 20s 窗口对齐）
+if (-not $script:piRecentErrorSec) { $script:piRecentErrorSec = 15 }
+if (-not $script:piRecentDoneSec) { $script:piRecentDoneSec = 20 }
+if ($null -eq $script:piEnabled) { $script:piEnabled = $true }
+
+$script:piDocCache = @{}      # path -> @{ stamp; header; state }
+$script:piRunPrev = @{}       # sessionId -> 上一帧是否在跑（逐会话下降沿）
+$script:piCompletionAt = 0    # 最近一次「某会话刚收尾」的时间（epoch ms）
+$script:piCompletionSummary = $null
+$script:piMissingLogged = $false
+$script:piSchemaWarned = @{}
+
+# ---------------- 配置入口（由主脚本调用） ----------------
+# 为什么用函数而不是让主脚本直接 `$script:piSessionsRoot = ...`：
+# 本文件是被 dot-source 进来的，跨文件写 `$script:` 变量的作用域解析规则很微妙
+# （`$script:` 到底落在谁的脚本作用域，取决于 dot-source 语义与函数定义位置）。
+# 由**本文件内**定义的函数来写、本文件内的函数来读，读写落在同一个作用域里，
+# 不依赖那条规则，行为是确定的。主脚本只需要调用这两个 setter。
+function Set-PiSourcePaths([string]$sessionsRoot, [string]$stateFile) {
+    if ($sessionsRoot) { $script:piSessionsRoot = $sessionsRoot }
+    if ($stateFile) { $script:piStateFile = $stateFile }
+    # 路径变了就把解析缓存清掉，避免拿着旧路径的结果继续用
+    $script:piDocCache = @{}
+    $script:piRunPrev = @{}
+}
+
+function Set-PiEnabled([bool]$enabled) {
+    $script:piEnabled = [bool]$enabled
+    if (-not $script:piEnabled) {
+        $script:piDocCache = @{}
+        $script:piRunPrev = @{}
+    }
+}
+
+function Get-PiSourceInfo {
+    return @{
+        enabled      = [bool]$script:piEnabled
+        sessionsRoot = [string]$script:piSessionsRoot
+        stateFile    = [string]$script:piStateFile
+    }
+}
+
+# 自测脚本用它观察/复位「刚收尾」缓冲（跨文件读 $script: 变量的作用域同样微妙，
+# 统一走函数出入口，行为确定）
+function Get-PiCompletionState {
+    return @{ at = [int64]$script:piCompletionAt; summary = $script:piCompletionSummary }
+}
+
+function Reset-PiCompletionState {
+    $script:piCompletionAt = 0
+    $script:piCompletionSummary = $null
+    $script:piRunPrev = @{}
+}
+
+function Restore-PiCompletionState([int64]$at, $summary) {
+    $script:piCompletionAt = [int64]$at
+    $script:piCompletionSummary = $summary
+}
+
+# ---------------- 小工具 ----------------
+# pi 的记录级 timestamp 是 ISO8601（UTC，带 Z）。转 epoch ms。
+function Convert-PiTimestamp([string]$ts) {
+    try {
+        if (-not $ts) { return [int64]0 }
+        $dt = [datetime]::Parse($ts, [System.Globalization.CultureInfo]::InvariantCulture,
+                                ([System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
+                                 [System.Globalization.DateTimeStyles]::AssumeUniversal))
+        return [int64](($dt - $script:epochRef).TotalMilliseconds)
+    } catch { return [int64]0 }
+}
+
+# 从 message.content 里取第一段文本：content 既可能是数组（正常消息），
+# 也可能是字符串（system 段）。
+function Get-PiFirstText($content, [int]$max = 200) {
+    try {
+        if ($null -eq $content) { return '' }
+        if ($content -is [string]) { return (Limit-Text ([string]$content) $max) }
+        foreach ($b in @($content)) {
+            if ($null -eq $b) { continue }
+            try {
+                if ($b.type -eq 'text' -and $b.text) { return (Limit-Text ([string]$b.text) $max) }
+            } catch { }
+        }
+    } catch { }
+    return ''
+}
+
+# 私有：从**显式偏移**读一段字节。
+# **必须 FileShare.ReadWrite**：pi 正在追加写这个文件，用默认共享模式会偶发
+# IOException，表现为轮询日志被刷屏。
+# 返回 @{ text; start; length }；start 是实际起点（便于调用方判断有没有截断）。
+function Read-PiSlice([string]$path, [int64]$start, [int]$maxBytes) {
+    $res = @{ text = ''; start = [int64]0; length = [int64]0 }
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open,
+                                     [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $len = $fs.Length
+        $res.length = $len
+        if ($len -le 0) { return $res }
+        if ($start -lt 0) { $start = [int64]0 }
+        if ($start -gt $len) { $start = $len }
+        $res.start = $start
+        $count = [int]($len - $start)
+        if ($count -le 0) { return $res }
+        # maxBytes <= 0 = 只要元数据（长度），**不读内容**。
+        # 这条很关键：Read-PiTailText 先用它取长度，若这里照读，
+        # 每次轮询都会把整个会话文件读进内存 —— 恰好废掉了「只读尾部窗口」的意义。
+        if ($maxBytes -le 0) { return $res }
+        if ($count -gt $maxBytes) { $count = $maxBytes }
+        [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
+        $buf = New-Object byte[] $count
+        $read = $fs.Read($buf, 0, $count)
+        if ($read -le 0) { return $res }
+        # 显式 UTF8 解码：pi 写的是不带 BOM 的 UTF-8，中文任务描述必须走这条路，
+        # 否则在某些代码页下会变成乱码。
+        $text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+        # 剥掉可能存在的 BOM。注意 .NET Framework 的 Trim() **不**把 U+FEFF 当空白，
+        # 不显式剥掉的话首行会以 U+FEFF 开头，导致
+        # ① `$t[0] -ne '{'` 把 session 头整行丢掉 ② ConvertFrom-Json 解析失败。
+        # 我们自己的测试夹具（PS 5.1 的 Set-Content -Encoding UTF8）就是带 BOM 的。
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) {
+            $text = $text.Substring(1)
+        }
+        $res.text = $text
+    } catch {
+        # 读不到（被独占/删除/权限）就当这次没有这个会话，不改任何状态
+    } finally {
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
+    return $res
+}
+
+# 读文件**开头**（取会话头那一行：cwd / id / version）。
+function Read-PiHeadText([string]$path, [int]$maxBytes) {
+    return (Read-PiSlice $path ([int64]0) $maxBytes)
+}
+
+# 读文件**结尾**窗口。
+# 返回 @{ text; truncated }：truncated = 窗口没覆盖到文件开头（首行可能是半行）。
+function Read-PiTailText([string]$path, [int]$maxBytes) {
+    $probe = Read-PiSlice $path ([int64]0) 0     # 只取长度，不读内容
+    $len = [int64]$probe.length
+    if ($len -le 0) { return @{ text = ''; truncated = $false } }
+    $start = $len - $maxBytes
+    if ($start -lt 0) { $start = [int64]0 }
+    $slice = Read-PiSlice $path $start $maxBytes
+    return @{ text = [string]$slice.text; truncated = ($start -gt 0) }
+}
+
+# 从尾部窗口切出「完整的 JSON 行」。
+# 两个必须处理的截断坑：
+#   ① 窗口首行可能是半行（截断点落在行中间）→ 丢弃；
+#   ② 末行可能正被写入（没有结尾换行）→ 丢弃，否则会解析到半条 JSON。
+function Read-PiTailLines([string]$path) {
+    $win = Read-PiTailText $path $script:piTailBytes
+    if (-not $win.text) { return @() }
+    $lines = @($win.text -split "`n")
+    if ($win.truncated -and $lines.Count -gt 1) {
+        $lines = @($lines[1..($lines.Count - 1)])
+    }
+    if (-not $win.text.EndsWith("`n")) {
+        if ($lines.Count -le 1) { return @() }
+        $lines = @($lines[0..($lines.Count - 2)])
+    }
+    return $lines
+}
+
+# 会话头（第一行）：只有 cwd / id / version。
+# 注意：pi 会话文件可能很大，所以这里**只读文件开头 4KB**（不是尾部窗口）——
+# 这是 Read-PiHeadText 与 Read-PiTailText 分开的原因。
+function Get-PiHeader([string]$path) {
+    try {
+        $win = Read-PiHeadText $path 4096
+        if (-not $win.text) { return $null }
+        $first = ($win.text -split "`n")[0]
+        if (-not $first) { return $null }
+        $rec = $first.Trim() | ConvertFrom-Json
+        if ($null -eq $rec -or [string]$rec.type -ne 'session') { return $null }
+        return $rec
+    } catch { return $null }
+}
+
+# ---------------- 核心：把「一批会话记录」解析成中间状态 ----------------
+# 抽成纯函数（不碰文件系统）是为了能用夹具直接自测 —— 见 tests/test-pi-source.ps1。
+# 只依赖 pi 的**核心**记录类型：session / model_change / message / compaction。
+# 刻意**不**依赖 custom(agent-summary)：那是扩展写的，纯净安装下不存在。
+function Get-PiStateFromRecords($records) {
+    $st = @{
+        provider = $null; model = $null
+        userTurns = 0; toolCalls = 0; toolResults = 0; failed = 0
+        lastTool = $null; lastPrompt = ''; lastPromptMeaningful = ''; lastSummary = $null
+        tailRole = $null; tailStop = $null
+        lastError = ''; lastErrorAt = 0; lastRecordAt = 0
+        compactionAt = 0
+        tokens = 0; cost = 0.0
+        pendingCount = 0
+    }
+    # toolCallId -> toolName（出现 toolCall 进，出现 toolResult 出）。
+    # 注意：解析窗口是文件尾部，窗口首行可能落在某个 toolResult 上（其 toolCall
+    # 在窗口之外）。Remove 不存在的 key 是 no-op，因此只会「少算」pending，
+    # 绝不会算出负数 —— 这个方向是安全的（少算只会退化成按 mtime 判断）。
+    $pending = @{}
+
+    foreach ($rec in $records) {
+        if ($null -eq $rec) { continue }
+        $type = ''
+        try { $type = [string]$rec.type } catch { continue }
+        $at = 0
+        try { $at = Convert-PiTimestamp ([string]$rec.timestamp) } catch { }
+        if ($at -gt $st.lastRecordAt) { $st.lastRecordAt = $at }
+
+        if ($type -eq 'model_change') {
+            try {
+                if ($rec.provider) { $st.provider = [string]$rec.provider }
+                if ($rec.modelId) { $st.model = [string]$rec.modelId }
+            } catch { }
+            continue
+        }
+        if ($type -eq 'compaction') {
+            $st.compactionAt = $at
+            continue
+        }
+        if ($type -eq 'custom') {
+            # agent-summary 只作为「加分项」填摘要，绝不作为收尾主信号
+            try {
+                if ([string]$rec.customType -eq 'agent-summary' -and $rec.data) {
+                    $bits = @()
+                    if ($null -ne $rec.data.commands) { $bits += ('{0} 次命令' -f [int]$rec.data.commands) }
+                    if ($null -ne $rec.data.edits) { $bits += ('{0} 次编辑' -f [int]$rec.data.edits) }
+                    if ($null -ne $rec.data.writes) { $bits += ('{0} 次写文件' -f [int]$rec.data.writes) }
+                    if ($bits.Count -gt 0) { $st.lastSummary = '· ' + ($bits -join ' · ') }
+                }
+            } catch { }
+            continue
+        }
+        if ($type -ne 'message') { continue }
+
+        $m = $null
+        try { $m = $rec.message } catch { }
+        if ($null -eq $m) { continue }
+        $role = ''
+        try { $role = [string]$m.role } catch { continue }
+
+        if ($role -eq 'system') { continue }
+
+        if ($role -eq 'user') {
+            $st.userTurns++
+            $t = Get-PiFirstText $m.content 200
+            if ($t) {
+                # 记「最近一条」（保底）
+                $st.lastPrompt = $t
+                # 再记「最近一条**有意义**的」：pi 用户经常只回一个字（"可以" / "+" / "继续"），
+                # 拿它当气泡里的任务描述毫无信息量。
+                # 判据：去掉标点/空白后长度 >= 4 才算有意义（"可以"=2 不算，"继续跑测试"算）。
+                $core = ($t -replace '[\s\p{P}\p{S}]', '')
+                if ($core.Length -ge 4) { $st.lastPromptMeaningful = $t }
+            }
+            $st.tailRole = 'user'
+            $st.tailStop = $null
+            continue
+        }
+
+        if ($role -eq 'assistant') {
+            try {
+                if ($m.provider) { $st.provider = [string]$m.provider }
+                if ($m.model) { $st.model = [string]$m.model }
+                if ($m.usage) {
+                    if ($m.usage.totalTokens) { $st.tokens += [int]$m.usage.totalTokens }
+                    if ($m.usage.cost) {
+                        try { if ($m.usage.cost.total) { $st.cost += [double]$m.usage.cost.total } } catch { }
+                    }
+                }
+            } catch { }
+
+            $stop = ''
+            try { $stop = [string]$m.stopReason } catch { }
+            $st.tailRole = 'assistant'
+            $st.tailStop = $stop
+            if ($stop -eq 'error') {
+                $st.failed++
+                $st.lastErrorAt = $at
+                try { $st.lastError = [string]$m.errorMessage } catch { }
+            }
+            try {
+                foreach ($b in @($m.content)) {
+                    if ($null -eq $b) { continue }
+                    if ($b.type -eq 'toolCall') {
+                        $id = [string]$b.id
+                        $name = [string]$b.name
+                        if ($id) { $pending[$id] = $name }
+                        $st.toolCalls++
+                        if ($name) { $st.lastTool = $name }
+                    }
+                }
+            } catch { }
+            continue
+        }
+
+        if ($role -eq 'toolResult') {
+            $st.toolResults++
+            try {
+                $id = [string]$m.toolCallId
+                if ($id) { [void]$pending.Remove($id) }
+                if ($m.isError) {
+                    $st.failed++
+                    $st.lastErrorAt = $at
+                }
+                $name = ''
+                try { $name = [string]$m.toolName } catch { }
+                if ($name) { $st.lastTool = $name }
+            } catch { }
+            $st.tailRole = 'toolResult'
+            $st.tailStop = $null
+            continue
+        }
+    }
+
+    $st.pendingCount = $pending.Count
+    return $st
+}
+
+# ---------------- 单个会话文件 → 状态（带缓存） ----------------
+function Get-PiFileState($file) {
+    try {
+        $path = [string]$file.FullName
+        $stamp = '{0}:{1}' -f $file.LastWriteTimeUtc.Ticks, $file.Length
+        $hit = $script:piDocCache[$path]
+        if ($null -ne $hit -and [string]$hit.stamp -eq $stamp) {
+            return $hit.state
+        }
+
+        $header = Get-PiHeader $path
+        if ($null -eq $header) {
+            # 首行还没写完（文件刚建）或不是 pi 会话 → 本轮跳过
+            $script:piDocCache[$path] = @{ stamp = $stamp; header = $null; state = $null }
+            return $null
+        }
+
+        $ver = 0
+        try { $ver = [int]$header.version } catch { $ver = 0 }
+        if ($ver -gt 3) {
+            # schema 升版：字段可能变了。不猜字段，但**仍然按已知字段尽力解析**
+            # （坏行/缺字段都会被下面逐行 try 吞掉），只是记一行日志便于排查。
+            $sid0 = [string]$header.id
+            if (-not $script:piSchemaWarned.ContainsKey($sid0)) {
+                $script:piSchemaWarned[$sid0] = $true
+                Write-Log ('pi source: session schema v{0} is newer than adapted v3 ({1}); parsing best-effort' -f $ver, $sid0)
+            }
+        }
+
+        $raw = Read-PiTailLines $path
+        $records = New-Object System.Collections.ArrayList
+        foreach ($line in $raw) {
+            if (-not $line) { continue }
+            $t = $line.Trim()
+            if ($t.Length -lt 3 -or $t[0] -ne '{') { continue }
+            try {
+                [void]$records.Add(($t | ConvertFrom-Json))
+            } catch {
+                # 坏行（写一半/编码问题）跳过，不中断整个文件
+            }
+        }
+
+        $st = Get-PiStateFromRecords $records
+        $state = @{
+            id = [string]$header.id
+            cwd = [string]$header.cwd
+            version = $ver
+            ageSec = ((Get-Date) - $file.LastWriteTime).TotalSeconds
+            parsed = $st
+        }
+        $script:piDocCache[$path] = @{ stamp = $stamp; header = $header; state = $state }
+        return $state
+    } catch {
+        return $null
+    }
+}
+
+# ---------------- 判定：单个会话是「在跑」还是「已收尾」 ----------------
+# 返回 @{ running; mode; reason }。mode 只用桌宠已有的词汇。
+function Get-PiSessionVerdict($state) {
+    $st = $state.parsed
+    $age = [double]$state.ageSec
+    $fresh = ($age -lt $script:piFreshSec)
+
+    $hasPending = ([int]$st.pendingCount -gt 0)
+    $toolUseTail = ($st.tailRole -eq 'assistant' -and $st.tailStop -eq 'toolUse')
+    $errTail = ($st.tailStop -eq 'error')
+    $doneTail = ($st.tailRole -eq 'assistant' -and $st.tailStop -eq 'stop')
+
+    # 「在跑」= 有悬空工具调用（最强信号，完全不看 mtime）
+    #        或 尾部明确还要调工具
+    #        或 尾部是 user/toolResult 且会话仍新鲜（agent 正在处理/思考）
+    # 注意：**错误尾部不算在跑** —— 否则会把「已失败」显示成「干活中」，
+    # 与你想要的「出错变红摇晃」正好相反。
+    $running = $false
+    if ($hasPending) { $running = $true }
+    elseif ($toolUseTail) { $running = $true }
+    elseif (($st.tailRole -eq 'user' -or $st.tailRole -eq 'toolResult') -and $fresh) { $running = $true }
+
+    $mode = 'idle'
+    $reason = 'idle'
+    if ($running) {
+        if ($hasPending) { $mode = 'working'; $reason = 'tool-pending' }
+        elseif ($toolUseTail) { $mode = 'working'; $reason = 'tooluse-tail' }
+        elseif ($age -lt 15) { $mode = 'working'; $reason = 'fresh-activity' }
+        else { $mode = 'review'; $reason = 'thinking' }
+    } elseif ($errTail -and $age -lt $script:piRecentErrorSec) {
+        $mode = 'failed'; $reason = 'error'
+    } elseif ($doneTail -and $age -lt $script:piRecentDoneSec) {
+        # 刚结束一轮（只在「刚刚」的窗口内才算 celebrating）。
+        # 必须带 $age 判断：否则几天前就跑完的会话会永远报 celebrating，
+        # 桌宠重启后会把它当成刚结束的任务反复庆祝。
+        # 真正的「收尾提醒」由聚合层的「逐会话下降沿」触发，这里只是让判定自洽。
+        $mode = 'celebrating'; $reason = 'turn-done'
+    }
+
+    return @{ running = $running; mode = $mode; reason = $reason }
+}
+
+# ---------------- 通道 2：会话 JSONL 聚合（零安装） ----------------
+function Get-StateFromPiSessions {
+    try {
+        if (-not (Test-Path -LiteralPath $script:piSessionsRoot)) {
+            if (-not $script:piMissingLogged) {
+                $script:piMissingLogged = $true
+                Write-Log ('pi source: sessions dir not found ({0}); pi compatibility idle' -f $script:piSessionsRoot)
+            }
+            return $null
+        }
+
+        $root = New-Object System.IO.DirectoryInfo $script:piSessionsRoot
+        $all = $root.GetFiles('*.jsonl', [System.IO.SearchOption]::AllDirectories)
+        if ($null -eq $all -or $all.Length -eq 0) { return $null }
+
+        # 候选：最近 piCandidateSec 内写过的 + 之前跟踪中的（保证收尾下降沿能被观测到）
+        $now = Get-Date
+        $candidates = New-Object System.Collections.ArrayList
+        foreach ($f in $all) {
+            $ageSec = ($now - $f.LastWriteTime).TotalSeconds
+            $tracked = $false
+            try { $tracked = $script:piRunPrev.ContainsKey([string]$f.Name) } catch { }
+            if ($ageSec -le $script:piCandidateSec -or $tracked) {
+                [void]$candidates.Add($f)
+            }
+        }
+        if ($candidates.Count -eq 0) { return $null }
+
+        # 只处理最新的若干会话，避免历史会话拖慢轮询
+        $ordered = @($candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 12)
+
+        # (a) 先把候选会话全部求值（含逐会话下降沿），(b) 再做聚合与去重。
+        # 分两步是为了在去重时能看到「同 cwd 的其它会话」，而不是边走边判。
+        $seen = New-Object System.Collections.ArrayList
+        $seenIds = @{}
+        $anyFresh = $false
+        $nowMs0 = [int64]((Get-Date).ToUniversalTime() - $script:epochRef).TotalMilliseconds
+
+        foreach ($f in $ordered) {
+            $state = Get-PiFileState $f
+            if ($null -eq $state) { continue }
+
+            $sid = [string]$state.id
+            if ($sid) { $seenIds[$sid] = $true }
+
+            $verdict = Get-PiSessionVerdict $state
+            $wasRunning = $false
+            if ($sid -and $script:piRunPrev.ContainsKey($sid)) { $wasRunning = [bool]$script:piRunPrev[$sid] }
+            if ($sid) { $script:piRunPrev[$sid] = [bool]$verdict.running }
+
+            # ---- 逐会话下降沿 = 「这一轮结束了」----
+            # 必须逐会话记「上一帧是否在跑」。共用一个全局标记时，B 会话的静止会被
+            # 误当成 A 会话的收尾（DSH 侧踩过，会误报/漏报完成）。
+            if ($wasRunning -and -not $verdict.running) {
+                # 完成时刻取「**现在**」（我们观察到下降沿的这一刻），而不是文件里
+                # 最后一条记录的时间戳。原因：
+                #  ① 语义上我们要表达的是「刚刚发现它收尾了」，提醒窗口（20s）就是以
+                #     这个时刻为基准的；
+                #  ② 用记录时间戳会依赖会话文件里的时钟，遇到 pi 写入时间与本地时钟
+                #     有偏差（或会话被挂起后恢复）就会算出「很久以前完成」，提醒直接丢失。
+                $script:piCompletionAt = $nowMs0
+                $bits = @()
+                if ($state.parsed.toolCalls -gt 0) { $bits += ('{0} 次工具调用' -f [int]$state.parsed.toolCalls) }
+                if ($state.parsed.failed -gt 0) { $bits += ('{0} 次失败' -f [int]$state.parsed.failed) }
+                if ($bits.Count -eq 0 -and $state.parsed.lastSummary) { $bits += [string]$state.parsed.lastSummary }
+                if ($bits.Count -gt 0) {
+                    $script:piCompletionSummary = '· ' + ($bits -join ' · ')
+                } else {
+                    $script:piCompletionSummary = $null
+                }
+            }
+
+            if ([double]$state.ageSec -lt 20) { $anyFresh = $true }
+
+            [void]$seen.Add(@{
+                id       = $sid
+                cwd      = [string]$state.cwd
+                ageSec   = [double]$state.ageSec
+                running  = [bool]$verdict.running
+                mode     = [string]$verdict.mode
+                reason   = [string]$verdict.reason
+                parsed   = $state.parsed
+            })
+        }
+
+        # (b) 子代理去重（Phase 1 兜底；Phase 2 装上扩展后由扩展给权威 sessionId）
+        #
+        # pi 会话头里**没有** parentSessionId（本机 36 个文件实测 0 命中），而
+        # pi-subagents 的子女会话默认也写进同一个 sessions 目录，且干活时写得更频繁。
+        # 所以**不能**用「取最新一个」去重 —— 那正好会优先选中子代理（方向反了）。
+        # 这里改用两个更稳的特征，按优先级：
+        #   ① userTurns 多的更像主会话（子代理通常只有一个由父会话生成的合成 prompt）；
+        #   ② 同分时取**开始得更早**的（父会话一定先于子会话创建）。
+        # 仍然只是启发式：命中不了也不会错到离谱（最坏是子代理进展被当主任务显示）。
+        $runningAll = @($seen | Where-Object { $_.running })
+        $byCwd = @{}
+        foreach ($s in $runningAll) {
+            $key = $s.cwd
+            if (-not $key) { $key = '__nocwd__' + [string]$s.id }
+            if (-not $byCwd.ContainsKey($key)) { $byCwd[$key] = @() }
+            $byCwd[$key] += $s
+        }
+        $runningSessions = New-Object System.Collections.ArrayList
+        foreach ($key in @($byCwd.Keys)) {
+            $group = @($byCwd[$key])
+            $chosen = $group[0]
+            if ($group.Count -gt 1) {
+                # 排序键用「负值」表达降序：避免在 Sort-Object 上写两行反引号续行
+                # （反引号续行对行尾空白很敏感，是这类脚本常见的隐蔽语法坑）。
+                $ranked = @($group | Sort-Object { -1 * [int]$_.parsed.userTurns }, { -1 * [double]$_.ageSec })
+                $chosen = $ranked[0]
+                $skipped = @($ranked | Select-Object -Skip 1 | ForEach-Object { $_.id })
+                Write-Log ('pi source: same cwd has {0} running sessions; using {1}, ignoring {2} (possible subagents)' -f
+                           $group.Count, $chosen.id, ($skipped -join ','))
+            }
+            # 气泡优先用「有意义的最近一条」：pi 里用户常只回 "可以" / "+" / "继续"，
+            # 直接显示那条对用户毫无信息量。只有在没有更有意义的输入时才退回它。
+            $shownPrompt = [string]$chosen.parsed.lastPromptMeaningful
+            if (-not $shownPrompt) { $shownPrompt = [string]$chosen.parsed.lastPrompt }
+            [void]$runningSessions.Add(@{
+                cwd    = $chosen.cwd
+                prompt = $shownPrompt
+                turns  = [int]$chosen.parsed.userTurns
+                steps  = [int]$chosen.parsed.toolCalls
+                tool   = $chosen.parsed.lastTool
+                mode   = $chosen.mode
+                reason = $chosen.reason
+                ageSec = $chosen.ageSec
+            })
+        }
+
+        # ---- 汇总（只在被选中的会话上统计，避免把子代理的数字算进主任务）----
+        $totalTurns = 0; $totalSteps = 0
+        $failureCount = 0
+        $lastErrorText = ''
+        $recentErrorAt = [int64]0
+        $provider = $null; $model = $null
+        $tokens = 0; $cost = 0.0
+        $compacting = $false
+        foreach ($s in $seen) {
+            $p = $s.parsed
+            $totalTurns += [int]$p.userTurns
+            $totalSteps += [int]$p.toolCalls
+            $failureCount += [int]$p.failed
+            $tokens += [int]$p.tokens
+            $cost += [double]$p.cost
+            if ($p.provider) { $provider = [string]$p.provider }
+            if ($p.model) { $model = [string]$p.model }
+            if ($p.compactionAt -gt 0 -and ($nowMs0 - $p.compactionAt) -lt 10000) { $compacting = $true }
+            # 「最近出错」用时间窗，而不是累计失败数：
+            # failureCount 覆盖整个 256KB 尾部窗口，长会话里几乎必然 >0，
+            # 拿它判 failed 会让桌宠永远显示红色。
+            if ([int64]$p.lastErrorAt -gt $recentErrorAt) {
+                $recentErrorAt = [int64]$p.lastErrorAt
+                $lastErrorText = [string]$p.lastError
+            }
+        }
+        $recentError = ($recentErrorAt -gt 0 -and
+                        ($nowMs0 - $recentErrorAt) -lt ($script:piRecentErrorSec * 1000))
+
+        # 跟踪表裁剪：会话文件被删/改名后不要无限增长
+        if ($script:piRunPrev.Count -gt 64) {
+            foreach ($k in @($script:piRunPrev.Keys)) {
+                if (-not $seenIds.ContainsKey($k)) { [void]$script:piRunPrev.Remove($k) }
+            }
+        }
+
+        # 全部会话都已收尾，且缓冲里有「刚刚」发生的一次完成
+        $nowMs = [int64]((Get-Date).ToUniversalTime() - $script:epochRef).TotalMilliseconds
+        $doneRecent = ($script:piCompletionAt -gt 0 -and ($nowMs - $script:piCompletionAt) -lt ($script:piRecentDoneSec * 1000))
+
+        if ($runningSessions.Count -eq 0 -and -not $doneRecent -and -not $anyFresh) {
+            # 没有在跑、也没有刚收尾 → 这个源此刻没有可报告的东西。
+            # 返回 idle 快照让上层知道「pi 装了但闲着」，便于显示来源标签。
+            return @{
+                mode           = 'idle'
+                seq            = 5
+                source         = 'pi'
+                agentSource    = 'pi'
+                message        = 'pi 待机中'
+                progressLines  = @()
+                waiting        = $false
+                waitingKind    = $null
+                waitingCount   = 0
+                waitingSeconds = 0
+                runningAgents  = 0
+                toolCount      = $totalSteps
+                lastTool       = $null
+                lastSummary    = $null
+                completedAt    = 0
+                failureCount   = $failureCount
+                taskText       = ''
+                piModel        = $model
+                piProvider     = $provider
+                piTurns        = $totalTurns
+                piSteps        = $totalSteps
+                piTokens       = $tokens
+                piCostTotal    = $cost
+                piCompacting   = $compacting
+            }
+        }
+
+        # ---- 聚合模式 ----
+        $mode = 'idle'
+        $message = ''
+        $progressLines = @()
+        $taskText = ''
+        $lastTool = $null
+        $runningCount = $runningSessions.Count
+
+        # 判 failed 用「最近 piRecentErrorSec 内出错」，**不用** failureCount：
+        # 后者统计的是整个 256KB 尾部窗口，长会话里几乎必然 >0，
+        # 一旦拿它判 failed，桌宠会在任务正常跑着的时候一直红色告警。
+        if ($recentError -and $runningCount -eq 0) {
+            $mode = 'failed'
+            if ($lastErrorText) { $message = '出错了：' + (Limit-Text $lastErrorText 40) }
+            else { $message = 'pi 出错了' }
+            $progressLines = @($message)
+        } elseif ($doneRecent -and $runningCount -eq 0) {
+            $mode = 'celebrating'
+        } elseif ($runningCount -gt 0) {
+            # 逐会话取最「实」的模式：有工具在跑优先于思考中
+            $mode = 'review'
+            foreach ($r in $runningSessions) {
+                if ($r.mode -eq 'working') { $mode = 'working'; break }
+            }
+            $lastTool = $null
+            foreach ($r in $runningSessions) { if ($r.tool) { $lastTool = [string]$r.tool } }
+
+            if ($runningCount -eq 1) {
+                $one = $runningSessions[0]
+                $taskText = [string]$one.prompt
+                $message = '进行中：' + (Limit-Text $taskText 46)
+                $progressLines += ('正在处理：' + (Limit-Text $taskText 40) +
+                                   (' · {0} 轮 / {1} 步' -f [int]$one.turns, [int]$one.steps))
+            } else {
+                $message = '{0} 个 pi 任务进行中' -f $runningCount
+                foreach ($r in $runningSessions) {
+                    $line = '· [pi] ' + (Limit-Text ([string]$r.prompt) 34) +
+                            ('（{0} 轮 / {1} 步）' -f [int]$r.turns, [int]$r.steps)
+                    $progressLines += $line
+                }
+                if ($progressLines.Count -gt 3) {
+                    $progressLines = @($progressLines[0..2])
+                    $progressLines += ('… 共 {0} 个 pi 任务进行中' -f $runningCount)
+                }
+            }
+        } else {
+            $mode = 'idle'
+            $message = 'pi 待机中'
+        }
+
+        if ($compacting) { $progressLines = @($progressLines) + @('（pi 正在压缩上下文）') }
+
+        $modeWeight = 5
+        if ($mode -eq 'waiting') { $modeWeight = 1 }
+        elseif ($mode -eq 'working') { $modeWeight = 2 }
+        elseif ($mode -eq 'celebrating') { $modeWeight = 3 }
+        elseif ($mode -eq 'review') { $modeWeight = 4 }
+        elseif ($mode -eq 'failed') { $modeWeight = 6 }
+        $seqFp = [int](((($totalTurns * 100000L) + ($totalSteps * 10L) +
+                        ($runningCount * 6L) + $modeWeight) % 2000000000L))
+
+        # 注意：`if` 不能作为表达式出现在哈希字面量里（PS 5.1 会报「if 不是有效表达式」，
+        # 这个坑 README 里针对启动器已记录过一次）。先算好变量再放进 @{}。
+        $completedValue = [double]0
+        if ($doneRecent) { $completedValue = [double]$script:piCompletionAt }
+
+        return @{
+            mode           = $mode
+            seq            = $seqFp
+            source         = 'pi'
+            agentSource    = 'pi'
+            message        = $message
+            progressLines  = @($progressLines)
+            waiting        = $false
+            waitingKind    = $null
+            waitingCount   = 0
+            waitingSeconds = 0
+            runningAgents  = $runningCount
+            toolCount      = $totalSteps
+            lastTool       = $lastTool
+            lastSummary    = $script:piCompletionSummary
+            completedAt    = $completedValue
+            failureCount   = $failureCount
+            taskText       = (Limit-Text $taskText 60)
+            piModel        = $model
+            piProvider     = $provider
+            piTurns        = $totalTurns
+            piSteps        = $totalSteps
+            piTokens       = $tokens
+            piCostTotal    = $cost
+            piCompacting   = $compacting
+        }
+    } catch {
+        Note-TickError 'pi-state-sessions' $_
+        return $null
+    }
+}
+
+# ---------------- 通道 1：扩展状态文件（精确，需装 pi 扩展） ----------------
+# 扩展用 pi 的 ui_prompt_start / ui_prompt_end 事件，这是**唯一**能可靠表达
+# 「pi 正在等你确认」的官方信号；纯文件尾随拿不到这一项。
+function Get-StateFromPiExtension {
+    try {
+        if (-not $script:piStateFile) { return $null }
+        if (-not (Test-Path -LiteralPath $script:piStateFile)) { return $null }
+
+        $resp = $null
+        try {
+            # 与 DSH 侧同样的写法：显式 UTF8 读整份快照（体积很小）
+            $resp = Get-Content -LiteralPath $script:piStateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch { return $null }
+        if ($null -eq $resp) { return $null }
+
+        # 新鲜度：扩展每 5s 心跳重写；过期说明 pi 已退出，不能采信陈旧状态
+        $updatedAt = 0
+        try { if ($resp.updatedAt) { $updatedAt = [int64]$resp.updatedAt } } catch { $updatedAt = 0 }
+        $fresh = $false
+        if ($updatedAt -gt 0) {
+            $nowMs = [int64]((Get-Date).ToUniversalTime() - $script:epochRef).TotalMilliseconds
+            $ageMs = $nowMs - $updatedAt
+            $fresh = ($ageMs -ge -5000 -and $ageMs -lt ($script:piStateFileFreshSec * 1000))
+        } else {
+            $ageSec = ((Get-Date) - (Get-Item -LiteralPath $script:piStateFile).LastWriteTime).TotalSeconds
+            $fresh = ($ageSec -lt $script:piStateFileFreshSec)
+        }
+        if (-not $fresh) { return $null }
+
+        $waitingKind = $null
+        try { if ($resp.waitingKind) { $waitingKind = [string]$resp.waitingKind } } catch { }
+        $msg = ''
+        try { $msg = [string]$resp.message } catch { }
+        if (-not $msg) {
+            if ($resp.waiting) { $msg = 'pi 正在等你确认' } else { $msg = 'pi 待机中' }
+        }
+        $approvals = @()
+        try { if ($resp.pendingApprovals) { $approvals = @($resp.pendingApprovals) } } catch { }
+
+        $lastToolExt = $null
+        if ($resp.lastTool) { $lastToolExt = [string]$resp.lastTool }
+        $modelExt = $null
+        if ($resp.model) { $modelExt = [string]$resp.model }
+        $providerExt = $null
+        if ($resp.provider) { $providerExt = [string]$resp.provider }
+
+        return @{
+            mode           = [string]$resp.mode
+            seq            = [int]$resp.seq
+            source         = 'pi'
+            agentSource    = 'pi'
+            message        = $msg
+            progressLines  = @($msg)
+            waiting        = [bool]$resp.waiting
+            waitingKind    = $waitingKind
+            waitingCount   = [int]$resp.waitingCount
+            waitingSeconds = [int]$resp.waitingSeconds
+            runningAgents  = [int]$resp.runningAgents
+            toolCount      = [int]$resp.toolCount
+            lastTool       = $lastToolExt
+            lastSummary    = [string]$resp.lastSummary
+            completedAt    = [double]$resp.completedAt
+            failureCount   = [int]$resp.failureCount
+            taskText       = ''
+            questionText   = [string]$resp.waitingTitle
+            piModel        = $modelExt
+            piProvider     = $providerExt
+            piTurns        = [int]$resp.turns
+            piSteps        = [int]$resp.steps
+            piCompacting   = [bool]$resp.compacting
+            pendingApprovals = $approvals
+            # pi 侧目前没有「在桌宠上直接批准」的通道（P3 未启用），
+            # 显式标成非 http，避免主脚本误显示 ✓/✗ 面板
+            approvalChannel = 'pi'
+        }
+    } catch {
+        return $null
+    }
+}
+
+# ---------------- 入口：两通道合并 ----------------
+# 优先级：扩展（精确，能表达「等你确认」）> 会话尾随（零安装，覆盖进展/收尾/出错）。
+# 两者都新鲜时，用扩展决定 mode/waiting，用会话补齐 model/turns/steps
+# （扩展不一定知道这些，会话文件里一定有）。
+function Get-StateFromPi {
+    if (-not $script:piEnabled) { return $null }
+    try {
+        $ext = Get-StateFromPiExtension
+        $ses = Get-StateFromPiSessions
+
+        if ($null -eq $ext -and $null -eq $ses) { return $null }
+        if ($null -eq $ext) { return $ses }
+        if ($null -eq $ses) { return $ext }
+
+        # 扩展权威地决定「等你确认」与模式；等待优先于一切
+        if ($ext.waiting) {
+            if (-not $ext.piModel -and $ses.piModel) { $ext.piModel = $ses.piModel }
+            if (-not $ext.piProvider -and $ses.piProvider) { $ext.piProvider = $ses.piProvider }
+            return $ext
+        }
+        # 扩展说闲着但会话正在跑 → 以会话为准（扩展可能还没收到事件）
+        if ($ses.runningAgents -gt 0) {
+            foreach ($k in @('piModel', 'piProvider', 'piTurns', 'piSteps', 'piTokens', 'piCostTotal')) {
+                if ($ses.ContainsKey($k) -and ($null -eq $ext[$k] -or $ext[$k] -eq 0)) { $ext[$k] = $ses[$k] }
+            }
+            return $ses
+        }
+        # 会话刚有完成事件而扩展还没标记 → 用会话的完成信息
+        if ($ses.completedAt -gt 0 -and $ext.completedAt -le 0) {
+            $ext.completedAt = $ses.completedAt
+            if ($ses.lastSummary) { $ext.lastSummary = $ses.lastSummary }
+        }
+        foreach ($k in @('piModel', 'piProvider', 'piTurns', 'piSteps', 'piTokens', 'piCostTotal')) {
+            if (-not $ext[$k] -and $ses[$k]) { $ext[$k] = $ses[$k] }
+        }
+        return $ext
+    } catch {
+        Note-TickError 'pi-state' $_
+        return $null
+    }
+}
+
+# ---------------- 初始化日志 ----------------
+# 注意：这里**不**打印就绪日志。模块被 dot-source 时，主脚本紧接着还会用
+# Config 覆盖 piSessionsRoot / piStateFile，此时打印会写出一个即将被改掉的路径，
+# 排查时反而误导。就绪日志由主脚本在覆盖之后统一打（见 kun-pet-desktop.ps1）。

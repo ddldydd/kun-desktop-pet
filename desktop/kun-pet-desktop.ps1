@@ -46,6 +46,10 @@ $Config = @{
     SessionsDir = Join-Path $env:USERPROFILE '.dsh\sessions'
     # DSH 会话投影缓存（明文 JSON，桌宠读取任务进展的主数据源）
     ProjCacheDir = Join-Path $env:USERPROFILE '.dsh\storages\session_projcache\sessions'
+    # pi coding agent（@earendil-works/pi-coding-agent）的会话目录与扩展状态文件。
+    # 只读：桌宠永不写 pi 目录（那里还有明文 API Key，绝不碰 auth.json / models.json）。
+    PiSessionsDir = Join-Path $env:USERPROFILE '.pi\agent\sessions'
+    PiStateFile   = Join-Path $env:USERPROFILE '.pi\agent\kun-pet-state.json'
     PetDirs     = @(
         (Join-Path $env:USERPROFILE '.petdex\pets'),
         (Join-Path $script:codexHome 'pets')
@@ -482,6 +486,18 @@ $state = [hashtable]::Synchronized(@{
     # 当前实际可用的插件通道（只用于变化时打一行日志，排查「审批时气泡没反应」）
     # 初值刻意用 'init' 这种哨兵值：启动后第一轮一定打一行，把当前通道写进日志
     dshChannel          = 'init'
+    # ---- pi coding agent 相关（与 DSH 完全并行，互不影响）----
+    # piEnabled: 是否把 pi 当作数据源（右键菜单可切换，持久化到 kun-pet-settings.json）
+    piEnabled           = $true
+    # 本帧 pi 源是否真的给出了快照（用于来源标签与气泡前缀）
+    piActive            = $false
+    # pi 当前模型/提供方（DSH 路径拿不到这些信息，只有 pi 会话里有）
+    piModel             = ''
+    piProvider          = ''
+    # 本帧的源标记：'dsh' / 'pi' / 'dsh+pi'，气泡底部据此显示
+    agentSource         = 'dsh'
+    # pi 源通道变化（'ext'=扩展状态文件 / 'sessions'=会话尾随 / $null=未生效）打一行日志
+    piChannel           = 'init'
     lastApprovalAlertId = $null
     alertFlashUntil = [datetime]::MinValue
     taskText = ''
@@ -670,6 +686,7 @@ function Render-PausedFrame {
             'harness'  { 'Harness 实时' }
             'dsh'      { 'DSH 插件接口' }
             'dsh-file' { 'DSH 插件快照文件' }
+            'pi'       { 'pi coding agent' }
             'sessions' { '会话活跃度（兜底）' }
             default    { '未连接' }
         }
@@ -868,6 +885,39 @@ function Limit-Text([string]$text, [int]$max) {
     $t = $t.Trim()
     if ($t.Length -le $max) { return $t }
     return $t.Substring(0, $max) + '…'
+}
+
+# ---------------- pi coding agent 源适配器（可选，fail-soft） ----------------
+# 必须放在 Limit-Text / Get-EpochMs / Note-TickError 之后：模块内部要复用它们。
+# 单独成文件（而不是内联在这里）是为了能被 tests/ 下的自测脚本直接 dot-source，
+# 用夹具驱动纯函数 Get-PiStateFromRecords 做回归，不需要真的起一只桌宠。
+# 文件缺失 / 语法不兼容时只记一行日志：DSH 侧功能完全不受影响。
+$script:piModuleLoaded = $false
+try {
+    $script:piModulePath = Join-Path $script:logDir 'kun-pet-pi-source.ps1'
+    if (Test-Path -LiteralPath $script:piModulePath) {
+        . $script:piModulePath
+        $script:piModuleLoaded = $true
+        # 用模块自己提供的 setter 写路径，而不是直接赋值 $script:piSessionsRoot：
+        # 跨文件写 $script: 变量的作用域解析很微妙，交给模块内的函数写，
+        # 读写一定落在同一个作用域里（自测脚本也走同一套入口）。
+        Set-PiSourcePaths ([string]$Config.PiSessionsDir) ([string]$Config.PiStateFile)
+        # 就绪日志放在设置之后：否则打印的是模块默认路径，排查时会误导
+        $piInfo = Get-PiSourceInfo
+        $piDirOk = Test-Path -LiteralPath ([string]$piInfo.sessionsRoot)
+        Write-Log ('pi source ready: sessions={0} exists={1} stateFile={2}' -f
+                   $piInfo.sessionsRoot, $piDirOk, $piInfo.stateFile)
+    } else {
+        Write-Log ('pi source module not found; pi compatibility disabled ({0})' -f $script:piModulePath)
+    }
+} catch {
+    Write-Log ('pi source module failed to load: ' + $_.Exception.Message)
+}
+
+# 没有模块时提供一个永远返回 $null 的同名函数，
+# 这样轮询里那句 $piSnap = Get-StateFromPi 不必到处写 if 判断。
+if (-not $script:piModuleLoaded -and -not (Get-Command -Name 'Get-StateFromPi' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Get-StateFromPi { return $null }
 }
 
 Function Get-StateFromHarness {
@@ -1446,6 +1496,9 @@ function Save-Settings {
             floating = [bool]$state.floating
             multiMode = [string]$state.multiTaskMode
             rotateSec = [int]$state.rotateSec
+            # pi 兼容开关：默认开。存的就是「是否启用」，读的时候用 $null -ne 判断存在性，
+            # 避免把「用户主动关掉」误判成「没保存过」而自动打开（petId 踩过同样的坑）。
+            piEnabled = [bool]$state.piEnabled
             posLeft = [double]$window.Left
             posTop  = [double]$window.Top
             # 窗口是 SizeToContent：尺寸随气泡文字变，只存左上角的话，
@@ -1495,6 +1548,12 @@ function Load-Settings {
             if ([int]::TryParse([string]$saved.rotateSec, [ref]$rs)) {
                 if ($rs -ge 1 -and $rs -le 60) { $state.rotateSec = $rs }
             }
+        }
+        # pi 兼容：用「字段是否存在」判断，而不是真假值 ——
+        # 与 petId 同一个坑：if ($saved.piEnabled) 会把「用户关掉了」当成「没存过」而重新打开。
+        if ($null -ne $saved.piEnabled) {
+            $state.piEnabled = [bool]$saved.piEnabled
+            if ($script:piModuleLoaded) { Set-PiEnabled $state.piEnabled }
         }
         if ($saved.posLeft -and $saved.posTop) {
             $screenW = [System.Windows.SystemParameters]::PrimaryScreenWidth
@@ -1644,19 +1703,30 @@ function Update-Alerts($snap) {
         $alertText = ''
         $alertVisible = $false
 
-        # 只有来自真实 Harness 状态源（会话缓存 / 插件接口）的快照才能触发提醒，
-        # 活跃度兜底来源不参与，避免误报
+        # 只有来自真实状态源的快照才能触发提醒，活跃度兜底来源不参与，避免误报。
+        # 'pi' 是真实源（pi 会话 JSONL / pi 扩展状态文件），同样要能喊人 ——
+        # 否则 pi 那边的「任务结束 / 出错 / 等你确认」全都不会提示。
         $isRealSource = ($null -ne $snap -and $snap.ContainsKey('source') -and
-                         ($snap.source -eq 'harness' -or $snap.source -eq 'dsh'))
+                         ($snap.source -eq 'harness' -or $snap.source -eq 'dsh' -or $snap.source -eq 'pi'))
         if ($isRealSource) {
-            # ---- 1) Harness 需要你确认 / 回答 ----
+            # 气泡前缀：让「是哪个 agent 在等你」一目了然
+            $who = 'Harness'
+            try {
+                if ($snap.ContainsKey('agentSource') -and $snap.agentSource -eq 'pi') { $who = 'pi' }
+                elseif ($snap.ContainsKey('source') -and $snap.source -eq 'pi') { $who = 'pi' }
+            } catch { }
+            # ---- 1) 需要你确认 / 回答 ----
             if ($snap.waiting) {
-                $isQuestion = ($snap.waitingKind -eq 'question')
+                # pi 的「等你」永远走「回答」这条语义：它来自 pi 的 ui_prompt_start
+                # （pi 自己的确认框/选择框），**不是** DSH 那种能在桌宠上代答的权限审批
+                # —— pi 侧目前没有批准通道。这样 $who='pi' 时绝不会落到「等待审批」措辞，
+                # 用户不会被误导去找一个并不存在的桌宠审批按钮。
+                $isQuestion = ($snap.waitingKind -eq 'question' -or $who -eq 'pi')
                 $headline = '需要你确认'
-                $detail = 'Harness 等待审批'
+                $detail = $who + ' 等待审批'
                 if ($isQuestion) {
                     $headline = '需要你回答'
-                    $detail = 'Agent 正在向你提问'
+                    $detail = if ($who -eq 'pi') { 'pi 正在向你提问' } else { 'Agent 正在向你提问' }
                     # 提问：把问题本身写进横幅（plan-review 单独措辞）
                     try {
                         if ($snap.ContainsKey('questionKind') -and $snap.questionKind -eq 'plan-review') {
@@ -1676,20 +1746,22 @@ function Update-Alerts($snap) {
                             if ($pa.Count -gt 0 -and $pa[0].toolName) { $tipTool = '：' + [string]$pa[0].toolName }
                         }
                     } catch { }
-                    $detail = 'Harness 等待审批' + $tipTool
+                    $detail = $who + ' 等待审批' + $tipTool
                 }
                 $waited = ''
                 if ($snap.waitingSeconds -gt 0) { $waited = '（已等 {0} 秒）' -f $snap.waitingSeconds }
                 $alertText = '{0}：{1}{2}' -f $headline, $detail, $waited
                 $alertVisible = $true
 
-                $key = 'waiting:' + [string]$snap.waitingKind
+                # key 里带上源：DSH 与 pi 同时在等时，两边各自喊一次，不会互相吞掉
+                $key = 'waiting:' + $who + ':' + [string]$snap.waitingKind
                 if ($state.lastAlertKey -ne $key) {
                     $state.lastAlertKey = $key
                     # 主动喊人：提示音 + 托盘通知（比气泡更显眼）
                     Play-Tones -freqs @(880, 1174.7, 880) -durMs 160 -gapMs 130
-                    $tip = 'Harness 正在等待你的确认/审批'
-                    if ($isQuestion) { $tip = 'Agent 正在向你提问，请回到 Harness 回答' }
+                    $tip = $who + ' 正在等待你的确认/审批'
+                    if ($isQuestion) { $tip = if ($who -eq 'pi') { 'pi 正在向你提问，请回到 pi 回答' } else { 'Agent 正在向你提问，请回到 Harness 回答' } }
+                    elseif ($who -eq 'pi') { $tip = 'pi 正在等你回答' + $tipTool + '，请回到 pi 窗口处理' }
                     elseif ($tipTool) { $tip = '待确认工具' + $tipTool + '，可在桌宠上直接同意/拒绝' }
                     try { $notify.ShowBalloonTip(6000, '⚠ ' + $headline, $tip, [System.Windows.Forms.ToolTipIcon]::Warning) } catch { }
                     # 置顶抢一下存在感（不激活输入焦点，避免打断打字）
@@ -1707,10 +1779,10 @@ function Update-Alerts($snap) {
                     $alertText = '任务结束 ✓' + $summary
                     $alertVisible = $true
 
-                    $key = 'done:' + [string]([int64]$snap.completedAt)
+                    $key = 'done:' + $who + ':' + [string]([int64]$snap.completedAt)
                     if ($state.lastAlertKey -ne $key) {
                         $state.lastAlertKey = $key
-                        $body = '任务已结束' + $summary
+                        $body = $who + ' 任务已结束' + $summary
                         try { $notify.ShowBalloonTip(7000, '✓ Kun Like 桌宠', $body, [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
                         $state.alertFlashUntil = (Get-Date).AddSeconds(8)
                         Write-Log ('alert: ' + $alertText)
@@ -1954,6 +2026,32 @@ $miFloat.add_Click({
 })
 $menu.Items.Add($miFloat) | Out-Null
 
+# pi coding agent 兼容开关：关掉后桌宠完全不理 pi（只跟 DSH），
+# 适合「不想看到 pi 的任务混进来」的场景。持久化到 kun-pet-settings.json。
+$miPi = [System.Windows.Forms.ToolStripMenuItem]::new('兼容 pi coding agent')
+$miPi.Checked = [bool]$state.piEnabled
+$miPi.add_Click({
+    try {
+        $state.piEnabled = -not $state.piEnabled
+        $miPi.Checked = $state.piEnabled
+        if ($script:piModuleLoaded) { Set-PiEnabled $state.piEnabled }
+        if (-not $state.piEnabled) {
+            # 关掉时立刻清空 pi 侧残留，避免气泡/提示停在 pi 的最后状态
+            $state.piActive = $false
+            $state.piModel = ''
+            $state.piProvider = ''
+            if ($state.lastAlertKey -and ([string]$state.lastAlertKey).Contains(':pi:')) {
+                $state.lastAlertKey = $null
+            }
+        }
+        Write-Log ('pi compatibility ' + $(if ($state.piEnabled) { 'enabled' } else { 'disabled' }))
+        Save-Settings
+    } catch {
+        Note-TickError 'pi-toggle' $_
+    }
+})
+$menu.Items.Add($miPi) | Out-Null
+
 $miThrough = [System.Windows.Forms.ToolStripMenuItem]::new('鼠标穿透')
 $miThrough.Enabled = $script:clickThroughAvailable
 $miThrough.add_Click({
@@ -2095,6 +2193,10 @@ Update-GapMenuChecks
 Update-MultiMenuChecks
 if ($state.paused) { $miPause.Text = '继续' }
 $miFloat.Checked = [bool]$state.floating
+# pi 开关的勾选状态要跟着设置走（菜单是在 Load-Settings 之前建的）
+$miPi.Checked = [bool]$state.piEnabled
+if ($script:piModuleLoaded) { Set-PiEnabled $state.piEnabled }
+Write-Log ('pi compatibility: ' + $(if ($state.piEnabled) { 'enabled' } else { 'disabled' }))
 # 启动时若处于暂停：先按当前状态画一帧，避免气泡停在上一个会话的旧文字或 "..."
 if ($state.paused) { Render-PausedFrame }
 
@@ -2109,6 +2211,9 @@ $pollTimer.Add_Tick({
         # 插件端点每次都读：它额外提供「待审批」列表（可在桌宠上直接同意/拒绝）
         $snap = Get-StateFromHarness
         $dshSnap = Get-StateFromDsh
+        # pi coding agent（并行数据源，可选）：扩展状态文件优先、会话尾随兜底。
+        # 它拿不到就返回 $null，DSH 侧逻辑一行都不受影响。
+        $piSnap = Get-StateFromPi
         # 插件通道变化只记一行日志：这是「审批时气泡没提示」最关键的排查线索
         $channelNow = $null
         if ($null -ne $dshSnap -and $dshSnap.ContainsKey('approvalChannel') -and $dshSnap.approvalChannel) {
@@ -2121,6 +2226,19 @@ $pollTimer.Add_Tick({
             } else {
                 Write-Log 'plugin channel: unavailable (/kun-pet/state 无响应，也没有新鲜的 kun-pet-state.json)'
             }
+        }
+        # pi 源通道变化同样只记一行（排查「pi 状态没上来」）
+        $piChannelNow = $null
+        if ($null -ne $piSnap) {
+            $piChannelNow = 'sessions'
+            try {
+                if ($piSnap.ContainsKey('approvalChannel') -and $piSnap.approvalChannel -eq 'pi') { $piChannelNow = 'ext' }
+            } catch { }
+        }
+        if ($piChannelNow -ne $state.piChannel) {
+            $state.piChannel = $piChannelNow
+            if ($piChannelNow) { Write-Log ('pi channel: ' + $piChannelNow) }
+            elseif ($state.piEnabled) { Write-Log 'pi channel: unavailable (no sessions / no extension state file)' }
         }
         if ($null -eq $snap) {
             $snap = $dshSnap
@@ -2141,6 +2259,87 @@ $pollTimer.Add_Tick({
                 }
             }
         }
+
+        # ---- pi 与 DSH 的多源仲裁 ----
+        # 规则（高 → 低），关键在于「等待」永远优先，谁在等都要立刻喊人；
+        # 其次错误，再次「刚收尾」，最后才是进展，避免一个源收工把另一个源的进展顶掉。
+        $state.piActive = ($null -ne $piSnap)
+        $state.piModel = ''
+        $state.piProvider = ''
+        if ($null -ne $piSnap) {
+            try { if ($piSnap.piModel) { $state.piModel = [string]$piSnap.piModel } } catch { }
+            try { if ($piSnap.piProvider) { $state.piProvider = [string]$piSnap.piProvider } } catch { }
+        }
+
+        if ($null -eq $snap -and $null -ne $piSnap) {
+            # 只有 pi 在跑
+            $snap = $piSnap
+            $state.agentSource = 'pi'
+        } elseif ($null -ne $snap -and $null -ne $piSnap) {
+            # 两边都有：按优先级合并
+            $dshWaiting = $false; $piWaiting = $false
+            try { $dshWaiting = [bool]$snap.waiting } catch { }
+            try { $piWaiting = [bool]$piSnap.waiting } catch { }
+            $dshRunning = ($snap.mode -eq 'working' -or $snap.mode -eq 'review')
+            $piRunning = ($piSnap.mode -eq 'working' -or $piSnap.mode -eq 'review')
+
+            if ($dshWaiting -or $piWaiting) {
+                # 任一侧在等你，就以那一侧为准（两侧都在等时优先 DSH，气泡仍会显示等待）
+                if ($piWaiting -and -not $dshWaiting) {
+                    $snap = $piSnap
+                    $state.agentSource = 'pi'
+                } else {
+                    $state.agentSource = 'dsh+pi'
+                }
+            } elseif ($piSnap.mode -eq 'failed' -and $snap.mode -ne 'failed') {
+                $snap = $piSnap
+                $state.agentSource = 'pi'
+            } elseif ($dshRunning -and $piRunning) {
+                # 两边都在跑：并列显示，各自带前缀（复用「多任务展示」三种模式）
+                $state.agentSource = 'dsh+pi'
+                $merged = @()
+                foreach ($l in @($snap.progressLines)) {
+                    if ($l) { $merged += ('[DSH] ' + ([string]$l -replace '^·\s*', '')) }
+                }
+                foreach ($l in @($piSnap.progressLines)) {
+                    if ($l) { $merged += ('[pi] ' + ([string]$l -replace '^·\s*', '')) }
+                }
+                if ($merged.Count -eq 0) {
+                    $merged += ('[DSH] ' + [string]$snap.message)
+                    $merged += ('[pi] ' + [string]$piSnap.message)
+                }
+                $snap.progressLines = @($merged)
+                # 任务数用两侧真实计数相加，而不是假设 DSH 只有 1 个
+                $dshAgents = 0
+                try { $dshAgents = [int]$snap.runningAgents } catch { $dshAgents = 1 }
+                if ($dshAgents -le 0) { $dshAgents = 1 }
+                $totalAgents = $dshAgents + [int]$piSnap.runningAgents
+                if ($totalAgents -le 0) { $totalAgents = 2 }
+                $snap.message = ('{0} 个任务进行中（DSH + pi）' -f $totalAgents)
+                # 计数与工具名取两边的合并值，让「第 N 次工具调用」不至于偏小
+                try { $snap.toolCount = [int]$snap.toolCount + [int]$piSnap.toolCount } catch { }
+                if (-not $snap.lastTool) { $snap.lastTool = $piSnap.lastTool }
+            } elseif ($piRunning -and -not $dshRunning) {
+                # DSH 闲着、pi 在跑 → 用 pi（否则 pi 的进展永远显示不出来）
+                $snap = $piSnap
+                $state.agentSource = 'pi'
+            } elseif ($dshRunning) {
+                $state.agentSource = 'dsh'
+            } else {
+                # 都不在跑：谁「刚收尾」就用谁，否则保持 DSH 空闲态
+                $piRecent = ($piSnap.completedAt -gt 0 -and (Get-EpochMs - [double]$piSnap.completedAt) -lt 20000)
+                $dshRecent = ($snap.completedAt -gt 0 -and (Get-EpochMs - [double]$snap.completedAt) -lt 20000)
+                if ($piRecent -and -not $dshRecent) {
+                    $snap = $piSnap
+                    $state.agentSource = 'pi'
+                } else {
+                    $state.agentSource = 'dsh+pi'
+                }
+            }
+        } else {
+            $state.agentSource = 'dsh'
+        }
+
         if ($null -eq $snap) {
             $snap = Get-StateFromSessions
             if ($null -eq $snap) { $snap = @{ mode = 'disconnected'; source = 'none' } }
@@ -2366,13 +2565,24 @@ $animTimer.Add_Tick({
             'harness'  { 'Harness 实时' }
             'dsh'      { 'DSH 插件接口' }
             'dsh-file' { 'DSH 插件快照文件' }
+            'pi'       { 'pi coding agent' }
             'sessions' { '会话活跃度（兜底）' }
             default    { '未连接' }
         }
+        # 两个源同时在用（气泡里并列显示 [DSH]/[pi]）时，底部标注出来，
+        # 否则只看到 "Harness 实时" 会以为 pi 那部分没生效。
+        if ($state.agentSource -eq 'dsh+pi' -and $state.piActive) {
+            $sourceLabel = $sourceLabel + ' + pi'
+        }
+        # pi 模型名（DSH 路径拿不到）：只在启用了 pi 且确实读到模型时才显示
+        $piLabel = ''
+        if ($state.piEnabled -and $state.piModel) {
+            $piLabel = ' · pi ' + (Limit-Text ([string]$state.piModel) 26)
+        }
         $pauseLabel = ''
         if ($state.paused) { $pauseLabel = ' · 已暂停' }
-        # 进展显示在气泡里；底部只保留来源/时长等辅助信息（仅变化时写，减少布局）
-        $hintValue = '{0}{1} · 已 {2}s' -f $sourceLabel, $pauseLabel, $elapsedSec
+        # 进展显示在气泡里；底部只保留来源/模型/时长等辅助信息（仅变化时写，减少布局）
+        $hintValue = '{0}{1}{2} · 已 {3}s' -f $sourceLabel, $piLabel, $pauseLabel, $elapsedSec
         if ($hintTextEl.Text -ne $hintValue) { $hintTextEl.Text = $hintValue }
     } catch { Note-TickError 'anim' $_ }
 })

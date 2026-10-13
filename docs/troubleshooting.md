@@ -6,6 +6,35 @@
 
 ## 一、桌宠起不来 / 看不到
 
+### ⚠️ 先看这条：`.ps1` 必须带 UTF-8 BOM（实测踩过）
+
+**现象**：用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\kun-pet-desktop.ps1`
+跑脚本时报**语法错误**，报错行里是乱码（如 `Unexpected token '浼氳瘽...'`），
+但双击 `启动桌宠.vbs` 却一切正常。
+
+**原因**：Windows PowerShell 5.1 在**没有 BOM** 时按系统 ANSI 代码页（中文机器上是 GBK）
+读取 `.ps1`。仓库里的脚本含中文，于是：
+
+1. 中文字符串/注释全部变乱码（气泡里的中文会花掉）；
+2. 更糟的是某些 GBK 双字节序列会把紧随其后的**引号吞掉**，直接变成语法错误。
+
+`启动桌宠.vbs` 之所以没事，是因为它显式按 UTF-8 读脚本再交给 ScriptBlock 执行：
+
+```vbs
+$c=[IO.File]::ReadAllText('...kun-pet-desktop.ps1',[Text.Encoding]::UTF8)
+```
+
+**处理**：给含非 ASCII 的脚本补 BOM（本仓库已提供工具）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\add-bom.ps1 -Path .\desktop
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\add-bom.ps1 -Path . -WhatIfOnly   # 只报告
+```
+
+> **改脚本的人注意**：有些编辑器/写入工具保存时会**去掉 BOM**。改完含中文的 `.ps1`
+> 后，用上面的 `add-bom.ps1` 补一次，否则 5.1 下又会解析失败。
+> 纯 ASCII 脚本（`KunPet-pet-running.ps1`、`add-bom.ps1` 自己）不受影响。
+
 ### 双击没反应，或黑框一闪而过
 
 1. 用 PowerShell 直接跑脚本看完整报错：
@@ -18,7 +47,8 @@
 3. 常见原因：
    - 执行策略拦截 → 用上面的 `-ExecutionPolicy Bypass`；
    - 被杀软 / 安全软件拦下 WPF 窗口创建 → 加白名单；
-   - 脚本被存成了非 UTF-8 → 重新从仓库下载（仓库文件带 UTF-8 BOM）。
+   - 脚本被存成了非 UTF-8，或因编辑丢了 UTF-8 BOM → 见本页最上面那条，
+     用 `tools\add-bom.ps1` 补回 BOM。
 
 ### 桌宠「不见了」，但进程还在
 
@@ -212,7 +242,86 @@ capability probe: GUI approval card cancel = available
 
 ---
 
-## 六、收集信息（开 Issue 用）
+## 六、pi coding agent 兼容
+
+### 桌宠完全不显示 pi 的状态
+
+按顺序查：
+
+1. **pi 目录在不在**。日志里应有 `pi source ready: sessions=… exists=True`。
+   若 `exists=False`，说明 pi 没装或没运行过（`~/.pi/agent/sessions` 由 pi 首次运行时创建）。
+2. **开关是否被关掉**。右键菜单 →「兼容 pi coding agent」要有勾选；
+   配置文件 `kun-pet-settings.json` 里 `piEnabled` 应为 `true`。
+3. **会话是否新鲜**。桌宠只看最近 15 分钟写过的会话；跑一次 pi 再观察。
+4. **看通道日志**。日志里会出现 `pi channel: sessions`（只读会话文件）
+   或 `pi channel: ext`（扩展状态文件）；两者都没有就是真的没读到数据。
+
+### 有进展提示，但 pi 等我的时候桌宠不喊
+
+**这是预期行为**，不是 bug：pi 的会话文件里**没有**「正在弹确认框」这类记录，
+所以纯读文件的通道**永远**拿不到「等待确认」。要补上这一项**必须装扩展**：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallPiExtension
+```
+
+装完在 **pi 里执行 `/reload`**（或重开 pi）。之后日志里应出现 `pi channel: ext`。
+
+### 装了扩展，但日志里不是 `pi channel: ext`
+
+- 确认文件在 `~/.pi/agent/extensions/kun-pet.ts`；
+- **必须 `/reload`**（或重开 pi）才会加载新扩展；
+- 看状态文件有没有在动：
+
+  ```powershell
+  Get-Content "$env:USERPROFILE\.pi\agent\kun-pet-state.json" -Raw
+  ```
+
+  里面 `updatedAt` 每 5 秒应变化一次（心跳）。若文件不存在或时间很旧，说明扩展没跑起来。
+
+### pi 的状态卡在「进行中」不消失
+
+正常情况下 pi 一轮结束会转成「任务结束」并复位。如果 pi 被**强制杀掉**：
+
+- 扩展通道：快照不再更新，桌宠 **30 秒**后不再采信（新鲜度窗口）；
+- 会话通道：文件不再写入，桌宠 **180 秒**后不再当成「在跑」。
+
+若长期卡住，检查日志里 `pi channel:` 是否在反复跳通道。
+
+### 同时装了 pi-subagents，桌宠把子代理显示成主任务
+
+pi 的会话头里没有 `parentSessionId`，所以只能启发式去重：**同一 cwd 下多个会话
+同时在跑时，保留「用户轮次最多」的那个**。日志里出现下面这行说明它在过滤：
+
+```
+pi source: same cwd has 2 running sessions; using <主会话id>, ignoring <子会话id> (possible subagents)
+```
+
+如果仍然认错，临时办法是把这个项目的 `cwd` 分开跑，或等扩展通道生效（扩展给的
+`sessionId` 更权威）。
+
+### 担心 pi 的 API Key 被读走
+
+不会。桌宠适配器只读两个路径：
+
+- `~/.pi/agent/sessions/**/*.jsonl`（会话记录）
+- `~/.pi/agent/kun-pet-state.json`（扩展自己写的快照）
+
+**绝不**打开 `models.json` / `auth.json` / `secrets.dpapi.json`。日志里也只会出现
+`provider` 名与模型 id，不写 key。
+
+### 自测 pi 适配器（不需要真的开 pi）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-source.ps1
+```
+
+用夹具覆盖「在跑 / 收尾 / 出错 / 坏数据 / 大文件截断」等场景，只写系统临时目录，
+不碰真实的 pi 与 DSH 数据。
+
+---
+
+## 七、收集信息（开 Issue 用）
 
 ```powershell
 # 桌宠进程
@@ -232,6 +341,12 @@ Select-String -Path .\kun-pet-desktop.log -Pattern 'frames/row|sprite|pet scan' 
 # 插件通道
 try { Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | ConvertTo-Json -Depth 3 } catch { "HTTP 不可用: $_" }
 Get-Content "$env:USERPROFILE\.dsh\kun-pet-host.log" -Tail 30 -ErrorAction SilentlyContinue
+
+# pi 通道
+Select-String -Path .\kun-pet-desktop.log -Pattern 'pi source|pi channel|same cwd' | Select-Object -Last 20
+Get-Content "$env:USERPROFILE\.pi\agent\kun-pet-state.json" -Raw -ErrorAction SilentlyContinue
+(Get-ChildItem "$env:USERPROFILE\.pi\agent\sessions" -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 5 Name, LastWriteTime)
 
 # 系统
 $PSVersionTable.PSVersion

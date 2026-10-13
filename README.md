@@ -20,6 +20,7 @@
 - [右键菜单](#右键菜单)
 - [装形象素材（换皮肤）](#装形象素材换皮肤)
 - [可选：装 DSH 插件（任务进展 + 审批按钮）](#可选装-dsh-插件任务进展--审批按钮)
+- [跟随 pi coding agent](#跟随-pi-coding-agent)
 - [可选：开机自启](#可选开机自启)
 - [配置文件](#配置文件)
 - [排错](#排错)
@@ -36,9 +37,12 @@
 |---|---|---|
 | `desktop/` | **桌面桌宠本体**：悬浮在 Windows 桌面上的那只宠物 | 不需要 |
 | `plugin/` | **DSH 插件 `@local/kun-pet`**：给桌面桌宠提供「审批 / 提问」数据通道，并能在 Harness 网页里再显示一只小宠 | 需要 |
+| `pi-extension/` | **pi coding agent 扩展**：把 pi 的运行时状态（尤其是「正在等你确认」）发布给桌宠 | 需要 pi |
 | `assets/pets/` | 两只随仓库附带的桌宠形象（`ikkun`、`haiyue-classic`），可直接用 | 不需要 |
 
 **不装 DSH 也能正常用**：桌宠会以待机动画待在桌面上，单击挥手、双击跳一下、拖动移动，只是不会有任务进展气泡。装上 `plugin/` 后它才会跟着任务状态变化。
+
+**装了 pi 也能跟着 pi**：桌宠可以同时跟随 DSH 与 **pi coding agent**（`@earendil-works/pi-coding-agent`），两者互不干扰。见 [跟随 pi coding agent](#跟随-pi-coding-agent)。
 
 ---
 
@@ -89,6 +93,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 .\install.ps1 -Autostart                 # 顺带注册开机自启
 .\install.ps1 -InstallPlugin             # 顺带装 DSH 插件（默认 profile: desktop）
 .\install.ps1 -InstallPlugin -Profile web
+.\install.ps1 -InstallPiExtension        # 顺带装 pi 扩展（补上「pi 正在等你确认」）
 .\install.ps1 -SkipAssets                # 不装素材（用内置矢量形象）
 .\install.ps1 -Target D:\pets\kun        # 装到别处
 ```
@@ -97,8 +102,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
-# 连素材 / 插件 / 自启一起清掉：
-powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAssets -RemovePlugin -RemoveAutostart
+# 连素材 / 插件 / pi 扩展 / 自启一起清掉：
+powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAssets -RemovePlugin -RemovePiExtension -RemoveAutostart
 ```
 
 ---
@@ -271,6 +276,112 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\plugin\toggle-gui-pet.ps1 
 
 ---
 
+## 跟随 pi coding agent
+
+桌宠可以**同时**跟随 **DSH** 和 **pi coding agent**（`@earendil-works/pi-coding-agent`）。两边互相独立：pi 没装就什么都不发生，pi 在跑也不会顶掉 DSH 的进展。
+
+### 两条通道（自动降级）
+
+| 通道 | 位置 | 需要装扩展吗 | 能拿到什么 |
+|---|---|---|---|
+| **会话文件**（默认可用） | `~/.pi/agent/sessions/<项目>/*.jsonl` | 不需要 | 在干活 / 收尾 / 出错 / 模型 / 轮次 / 步骤 |
+| **扩展状态** | `~/.pi/agent/kun-pet-state.json` | 需要 `pi-extension/` | 上面全部 **+ 「pi 正在等你确认」** |
+
+桌宠**优先用扩展**，拿不到就退回只读会话文件。所以：
+
+- **什么都不装**就已经能跟随 pi 的进展（桌宠只读 pi 的会话文件，**不写 pi 目录**）。
+- 只有想要「pi 在等你确认时桌宠喊你」时，才需要装扩展 —— 因为 **pi 的会话文件里没有这类记录**，`ui_prompt_start` 是唯一能表达它的官方信号，而它只在扩展里可见。
+
+### 装扩展（可选，推荐）
+
+```powershell
+# 方式一：一键安装时顺带装
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallPiExtension
+
+# 方式二：手动拷
+$dest = "$env:USERPROFILE\.pi\agent\extensions"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Copy-Item .\pi-extension\kun-pet.ts $dest -Force
+```
+
+装完在 **pi 里执行 `/reload`**（或重开 pi）生效。桌宠日志里出现 `pi channel: ext` 就说明扩展通道通了。
+
+卸载：删掉 `~/.pi/agent/extensions/kun-pet.ts` 即可（桌宠自动退回会话文件通道）。
+
+### pi 状态 → 桌宠表现
+
+| pi 的状态 | 桌宠表现 | 靠哪条通道 |
+|---|---|---|
+| 正在执行工具 | 💧 快速蹦跳 + 「正在执行 bash（第 N 次）」 | 两条都行 |
+| 正在思考 / 生成 | 🔍 探头（review） | 两条都行 |
+| **正在等你回答** | ⏳ 抖动 + 琥珀色横幅（含问题原文）+ 提示音 + 托盘通知 | **仅扩展** |
+| 出错 | ❗ 变红摇晃 + 提示音 | 两条都行 |
+| 任务结束 | 🎉 跳跃 + 「任务结束 ✓ · N 次工具调用」 | 两条都行 |
+| 上下文压缩中 | 气泡加一行「pi 正在压缩上下文」 | 两条都行 |
+
+> pi 的「等你」只在**扩展**通道里有：它来自 pi 的 `ui_prompt_start` 事件（pi 自己的
+> 确认框/选择框），会话文件里没有任何等价记录。
+>
+> 它与 DSH 的**权限审批不是一回事**：DSH 的审批可以在桌宠上直接 ✓同意/✗拒绝，
+> **pi 的等待必须在 pi 窗口里回答**（pi 侧目前没有给桌宠的批准通道）。
+> 所以横幅写的是「需要你回答」，桌宠也不会显示 ✓/✗ 按钮。
+
+### DSH 与 pi 同时跑
+
+桌宠是**全局**的，两边同时在跑时**并列显示**，各自带前缀：
+
+```
+· [DSH] 正在处理：修登录 bug（2 轮 / 5 步）
+· [pi] 正在处理：补 README 安装步骤（1 轮 / 3 步）
+```
+
+底部来源会写成「Harness 实时 + pi」。**任一侧在等你，都立刻喊人**（横幅会写明是 DSH 还是 pi）。
+
+### 开关
+
+右键菜单 → **「兼容 pi coding agent」**（带勾选，持久化到 `kun-pet-settings.json` 的 `piEnabled`）。关掉后桌宠完全不理 pi。
+
+配置文件里的相关项：
+
+| 字段 | 含义 |
+|---|---|
+| `piEnabled` | 是否跟随 pi（默认 `true`） |
+
+### 排错
+
+| 现象 | 处理 |
+|---|---|
+| 桌宠完全不显示 pi 状态 | ①看日志有没有 `pi source ready: … exists=True`；②确认 `~/.pi/agent/sessions` 存在；③菜单里「兼容 pi coding agent」是否被关掉 |
+| 只有进展、没有「等你确认」 | 正常 —— 这一项**必须**装扩展（见上）。装了扩展后日志应出现 `pi channel: ext` |
+| 装了扩展但仍是 `pi channel: sessions` | 扩展没生效：在 pi 里 `/reload`；确认文件在 `~/.pi/agent/extensions/kun-pet.ts` |
+| pi 状态卡在「进行中」不消失 | 看日志有没有 `pi channel: …` 反复跳。正常情况下 pi 一轮结束会转成「任务结束」；若 pi 被强杀，快照/会话文件不再更新，桌宠会在 30s（扩展）/180s（会话）后自动回落待机 |
+| 同时装了 `pi-subagents` | 子代理会话与主会话写在同一个目录。桌宠**按 cwd 去重**（优先保留用户轮次多的那个）来尽量避免把子代理显示成主任务；日志里会出现 `same cwd has N running sessions; using …` 说明它在过滤 |
+
+> pi 的「等你」和 DSH 的「审批」**不是一回事**：pi 那边来自它自己的确认框/选择框，
+> 只能在 pi 窗口里回答，桌宠**不会**（也没有能力）替你点同意。所以横幅写的是
+> 「需要你回答」，而不是「需要你确认」。
+
+> ⚠️ **安全**：桌宠**只读** `~/.pi/agent/sessions/` 与扩展的 `kun-pet-state.json`。
+> 它**绝不**读取 `~/.pi/agent/models.json`、`auth.json`、`secrets.dpapi.json` —— 那些文件里有明文 API Key。
+
+### 自测（不需要真的开 pi）
+
+```powershell
+# 1) 纯逻辑 + 夹具（56 项）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-source.ps1
+
+# 2) 接入与多源仲裁（25 项）：dot-source、并列显示、等待优先、过期快照、开关
+powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-integration.ps1
+
+# 3) 拿本机**真实**的 ~/.pi/agent/sessions 跑一遍（只读）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-source-real.ps1
+```
+
+都只写系统临时目录，不碰真实的 pi 与 DSH 数据。第 3 个能最直观地看出
+「哪些会话被识别为在跑 / 空闲」以及提取到的模型、轮次、步骤。
+
+---
+
 ## 可选：开机自启
 
 把这两个文件放进「启动」文件夹（`Win+R` 输入 `shell:startup`）：
@@ -300,6 +411,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\plugin\toggle-gui-pet.ps1 
 | `posLeft` / `posTop` / `posW` / `posH` | 窗口位置与尺寸（按「底边 + 水平中心」还原，夹在工作区内） |
 | `gapPx` | 气泡与宠物的间距 |
 | `multiMode` / `rotateSec` | 多任务展示方式 / 轮换间隔秒数 |
+| `piEnabled` | 是否跟随 pi coding agent（默认 `true`；右键菜单可切换） |
 | `paused` | 是否暂停动画 |
 | `floating` | 是否开启鼠标穿透 |
 

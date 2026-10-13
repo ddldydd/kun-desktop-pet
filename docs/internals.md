@@ -8,13 +8,31 @@
 
 ```
 desktop/kun-pet-desktop.ps1     单文件应用：WPF 渲染 + 状态机 + 素材加载 + 托盘 + 审批面板
+desktop/kun-pet-pi-source.ps1   pi coding agent 源适配器（只读尾随 + 扩展快照，可单独自测）
+desktop/tests/                  pi 源适配器的夹具与三个自测脚本（不需要真的起桌宠）
 plugin/index.js                 DSH 插件 host 半区：状态机、HTTP/文件双通道、审批应答
 plugin/client.js                DSH 插件 client 半区：DSH 网页右下角那只小宠
+pi-extension/kun-pet.ts         pi 扩展：把 pi 状态写成 JSON 快照（含「正在等你」）
+tools/add-bom.ps1               给含中文的 .ps1 补 UTF-8 BOM（见下文「编码」一节）
 install.ps1 / uninstall.ps1     安装 / 卸载
 tools/autostart/                开机自启模板（纯 ASCII）
 ```
 
 桌宠**不依赖插件也能跑**：拿不到任务状态时就停在待机动画。插件提供「工具名 + 审批」两类信息；任务进展默认读会话投影缓存。
+
+### 编码：`.ps1` 必须带 UTF-8 BOM
+
+Windows PowerShell 5.1 对**没有 BOM** 的 `.ps1` 按系统 ANSI 代码页（中文机器是 GBK）读取。
+脚本里有中文时，轻则乱码，重则某些 GBK 双字节序列把后面的引号吞掉 ⇒ **直接语法错误**。
+仓库里所有含非 ASCII 的脚本都带 BOM；`tools/add-bom.ps1` 用来在编辑后补回。
+`tools/add-bom.ps1` 自己是**纯 ASCII 且不带 BOM**（这样它在任何代码页下都能跑起来执行修复）。
+
+> 这条是**实测**结论：用 `powershell -File` 跑过一遍所有脚本，不带 BOM 时会报
+> `Unexpected token '浼氳瘽...'` 之类的解析错误。`启动桌宠.vbs` 之所以不受影响，
+> 是因为它自己用 `[IO.File]::ReadAllText(path, UTF8)` 读取后再交给 ScriptBlock。
+>
+> CI 里本来就有这条检查（`.github/workflows/checks.yml`），所以「含中文的 `.ps1` 必须带 BOM」
+> 一直是本仓库的既定规则 —— 只是历史上这些文件并没有真的带 BOM，属于存量遗漏。
 
 ---
 
@@ -50,6 +68,78 @@ tools/autostart/                开机自启模板（纯 ASCII）
 
 另一个坑：`active` 条目的 `state` 为 `continued` 时表示**已经答过、Agent 正在继续**，
 只认 `state = open` 才是真的在等你。
+
+### pi coding agent 作为并行数据源
+
+`kun-pet-pi-source.ps1` 把 pi 也做成一个源，产出与上面**完全相同形状**的快照，
+所以渲染/动画/提醒/多任务展示一行都没改。两条通道自动降级：
+
+| 通道 | 位置 | 覆盖面 |
+|---|---|---|
+| 扩展快照 | `~/.pi/agent/kun-pet-state.json`（`pi-extension/kun-pet.ts` 每 5s 心跳重写） | 全部 + **「正在等你确认」** |
+| 会话尾随 | `~/.pi/agent/sessions/<转义cwd>/<ts>_<id>.jsonl`（只读） | 在干活 / 收尾 / 出错 / 模型 / 轮次 |
+
+**为什么「等待确认」必须靠扩展**：pi 的会话文件里没有任何「正在弹确认框」的记录，
+唯一能表达的官方信号是 `ui_prompt_start` / `ui_prompt_end` 事件，它只在扩展上下文里可见。
+
+#### 判定规则（只依赖 pi 的核心记录类型）
+
+| 信号 | 结论 |
+|---|---|
+| 有 `toolCall` 没有配对的 `toolResult`（悬空） | 在干活（**不看 mtime**，最强信号） |
+| 尾部 assistant 且 `stopReason='toolUse'` | 在干活 |
+| 尾部是 user/toolResult 且文件 < 180s | 在干活 / 思考中 |
+| 尾部 assistant 且 `stopReason='error'` 且 < 15s | 出错 |
+| 配平 + 尾部 `stopReason='stop'` + 刚结束 | 任务结束（**逐会话下降沿**触发一次） |
+
+**刻意不用 `custom/agent-summary` 判收尾**：那是**扩展**写的（`deepseek-cache` 之类），
+纯净安装下不存在，只能当摘要加分项。核心信号是「配平 + mtime + stopReason」。
+
+#### 三个必须处理的读取坑
+
+1. **读头 ≠ 读尾**。会话头（`cwd`/`id`/`version`）在第一行，可能远在尾部窗口之外，
+   所以 `Read-PiHeadText`（读文件开头 4KB）与 `Read-PiTailText`（读末尾 256KB）是
+   两个函数。早期把两者合成一个「取最后 N 字节」的实现，导致所有 >4KB 的会话都被
+   当成「不是 pi 会话」跳过 —— pi 支持静默失效。
+2. **两个截断点**。尾部窗口首行可能是半行（丢弃）；末行可能正被写入、没有结尾换行
+   （丢弃），否则会解析到半条 JSON。
+3. **BOM**。`.NET Framework` 的 `Trim()` 不把 `U+FEFF` 当空白，不显式剥掉的话首行会以
+   BOM 开头，`$t[0] -ne '{'` 会把 session 头整行丢掉。
+
+另外：取文件长度只读元数据、不读内容（`Read-PiSlice` 在 `maxBytes -le 0` 时直接返回），
+否则每次轮询都会把整个会话文件读进内存，正好废掉「只读尾部窗口」的意义。
+实测本机最大的会话文件有 **2.4 MB**，这个优化不是纸面上的。
+
+#### 自测（三层，都不需要真的起桌宠）
+
+| 脚本 | 覆盖 | 规模 |
+|---|---|---|
+| `tests/test-pi-source.ps1` | 记录解析、单会话判定、端到端聚合、坏数据、大文件截断 | 56 项 |
+| `tests/test-pi-integration.ps1` | **接入层**：dot-source 可见性、多源仲裁分支、并列显示、等待优先、过期快照、开关 | 25 项 |
+| `tests/test-pi-source-real.ps1` | 拿本机**真实** `~/.pi/agent/sessions` 只读跑一遍（人工核对输出） | — |
+
+接入层单独测是有意的：模块自己测通了，不代表 `kun-pet-desktop.ps1` 里那段仲裁写对了。
+集成测试把主脚本的仲裁分支**逐条重放**，包括「DSH 与 pi 同时在跑 → 并列显示」和
+「pi 在等 → 优先于 DSH 在跑」。
+
+写测试时踩到的坑（**已实测确认**，留作前车之鉴）：
+
+- `test-pi-integration.ps1` 里的 `Check` 是 `Check <名称> <实际> <期望>` **三个**参数。
+  少传第三个时 `$expected` 会默认成 `$null`，于是断言拿 `'True'` 去比 `<null>`，
+  报出来的是「期望=`<null>` 实际=True」这种看着像被测代码坏了、其实是**测试自己**写错的失败。
+  断言布尔值请用 `CheckTrue`（内部固定和 `'True'` 比）。
+- （顺带纠正两个我原以为的坑，实测**不成立**，不要照抄到别处：
+  `-match` 不匹配时返回的是布尔 `$False` 而不是 `$null`；
+  `return ,$list` 与 `return $list` 在函数返回值上表现一致 ——
+  外层数组会被 PowerShell 的管道再展开一层。）
+
+#### 子代理排除（已知的启发式，不是精确解）
+
+`pi-subagents` 的子女会话默认也写进同一个 `sessions/` 目录，且干活时写得更频繁。
+pi 的会话头里**没有** `parentSessionId`（本机 36 个文件实测 0 命中），所以只能启发式：
+**同一 cwd 下多个会话同时在跑时，保留「用户轮次最多」的**（子代理通常只有一个由父会话
+生成的合成 prompt），同分时保留更早创建的那个。命中不了也不会错到离谱（最坏是子代理
+进展被当主任务显示）。装了扩展后以扩展给的 `sessionId` 为准，这一层就退化了。
 
 ---
 
