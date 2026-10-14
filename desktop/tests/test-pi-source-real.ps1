@@ -1,6 +1,9 @@
 ﻿# 用**真实**的 pi 会话数据验证适配器（只读，不写任何 pi 目录）。
 # 目的：夹具是自己造的，只有真数据才能证明「配平判定」「模型/轮次提取」在
 # 真实的 ~/.pi/agent/sessions 上成立。
+#
+# 注意：这是**手动核对用**的脚本，不接入 CI —— runner 上没有真实 pi 数据。
+# 所以在找不到数据时它是「跳过」而不是「失败」，退出码 0。
 $modulePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'kun-pet-pi-source.ps1'
 if (-not (Test-Path -LiteralPath $modulePath)) {
     Write-Host ("找不到模块: " + $modulePath) -ForegroundColor Red
@@ -8,11 +11,19 @@ if (-not (Test-Path -LiteralPath $modulePath)) {
 }
 . $modulePath
 
-$root = Join-Path $env:USERPROFILE '.pi\agent\sessions'
+# 复用模块的家目录解析（Windows 用 USERPROFILE，Linux/macOS 用 HOME），
+# 不要直接读 $env:USERPROFILE —— 在 Linux 上它是空串。
+$homeDir = Get-PiHomeDir
+$root = Join-Path $homeDir '.pi/agent/sessions'
 Write-Output ("pi sessions root : " + $root)
 Write-Output ("exists           : " + (Test-Path -LiteralPath $root))
 
-Set-PiSourcePaths $root (Join-Path $env:USERPROFILE '.pi\agent\kun-pet-state.json')
+if (-not (Test-Path -LiteralPath $root)) {
+    Write-Host "本机没有 pi 会话数据 → 跳过（不影响结论；这是手动核对脚本，不是 CI 用例）" -ForegroundColor Yellow
+    exit 0
+}
+
+Set-PiSourcePaths $root (Join-Path $homeDir '.pi/agent/kun-pet-state.json')
 Reset-PiCompletionState
 
 $all = @(Get-ChildItem -LiteralPath $root -Recurse -Filter *.jsonl -File -ErrorAction SilentlyContinue |

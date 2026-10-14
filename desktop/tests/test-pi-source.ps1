@@ -333,12 +333,19 @@ Write-Host "=== 4. 多窗口 / 子代理排除（纯函数级）===" -Foreground
 # 直接验证「段数」判据本身（与模块内 $depth 的算法逐字一致）：
 #   主会话 = 根/转义cwd/文件                  → 2 段 → 不跳过
 #   子代理 = 根/转义cwd/subagent-artifacts/…  → ≥3 段 → 跳过
-$sessionsRootLen = 'E:\pi\agent\sessions'.Length
+#
+# 用 [IO.Path]::DirectorySeparatorChar 拼路径，保证 Windows(\) 与 Linux(/) 都能跑
+# —— CI 就在 ubuntu-latest 上（pwsh 7 / Linux）。早先这里硬编码 'E:\...'，
+# 在 Linux 上会把整条路径当成一个段，断言全错。
+$sep = [IO.Path]::DirectorySeparatorChar
+$rootPrefix = 'PIROOT' + $sep + 'agent' + $sep + 'sessions' + $sep
+$sessionsRootLen = $rootPrefix.Length
 foreach ($case in @(
-    @{ p = 'E:\pi\agent\sessions\--E--proj--\2026-01-01_a.jsonl';  want = 2 },
-    @{ p = 'E:\pi\agent\sessions\--E--proj--\subagent-artifacts\run-0\session.jsonl'; want = 4 }
+    @{ rel = 'proj' + $sep + 'a.jsonl';                                   want = 2 },
+    @{ rel = 'proj' + $sep + 'subagent-artifacts' + $sep + 'run-0' + $sep + 'session.jsonl'; want = 4 }
 )) {
-    $rel = $case.p.Substring($sessionsRootLen).TrimStart('\','/')
+    $full = $rootPrefix + $case.rel
+    $rel = $full.Substring($sessionsRootLen).TrimStart('\', '/')
     $depth = @($rel -split '[\\/]').Count
     Check ("段数判据: " + $rel) $depth $case.want
     CheckTrue ("  该文件应" + $(if ($case.want -gt 2) { '被跳过' } else { '被保留' })) (($depth -gt 2) -eq ($case.want -gt 2))

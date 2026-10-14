@@ -87,13 +87,21 @@ jobs:
           # 这几套都不需要真的装 pi、也不需要起桌宠：只读夹具与系统临时目录。
           # 覆盖「toolCall/toolResult 配平判定」「多源仲裁」「多窗口（同目录多个 pi）」
           # 「子代理产物按目录层级排除」「过期快照」「大文件截断」等。
+          #
+          # 注意：runner 是 ubuntu + pwsh 7，没有 $env:USERPROFILE（只有 $env:HOME）。
+          # 模块与测试都已按跨平台处理；这里逐个跑并明确报告是哪一套挂了。
+          #
+          # 这里**直接调用脚本**（`& ./x.ps1` 或 `& ./x.ps1 -Param v`），
+          # 不要写成 `& pwsh -File ./x.ps1 @extraArgs` —— 那种拼法会让参数落到
+          # pwsh 的位置参数上（报「找不到接受自变量的位置参数」），脚本根本不会执行，
+          # 却因为退出码非 0 被记成「失败」。
           $fail = 0
           & ./desktop/tests/test-pi-source.ps1
-          if ($LASTEXITCODE -ne 0) { $fail = 1 }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::pi unit 测试失败"; $fail = 1 }
           & ./desktop/tests/test-pi-integration.ps1
-          if ($LASTEXITCODE -ne 0) { $fail = 1 }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::pi integration 测试失败"; $fail = 1 }
           & ./desktop/tests/test-pi-multiwindow.ps1 -Windows 3
-          if ($LASTEXITCODE -ne 0) { $fail = 1 }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::pi multiwindow 测试失败"; $fail = 1 }
           if ($fail -ne 0) { exit 1 }
 
       - name: 安装检查依赖

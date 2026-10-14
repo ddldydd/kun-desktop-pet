@@ -48,11 +48,35 @@ if (-not $script:epochRef) {
 }
 
 # ---------------- 配置（主脚本的 Load-Settings 可覆盖） ----------------
+# 家目录解析必须跨平台且容错：
+#   - Windows PowerShell 5.1 / 7 有 $env:USERPROFILE
+#   - Linux/macOS（CI 就跑在 ubuntu-latest 上）只有 $env:HOME
+# 早先这里直接 `Join-Path $env:USERPROFILE ...`，在 Linux 上 USERPROFILE 为空串，
+# Join-Path 会抛 ParameterBindingValidationException —— 而且是**在 dot-source 阶段**
+# 抛，导致本文件后面所有函数都没被定义（CI 上表现为「测试全挂」）。
+# 所以这里先稳妥地求出家目录，求不到就退回当前目录，绝不抛。
+function Get-PiHomeDir {
+    foreach ($v in @($env:USERPROFILE, $env:HOME, $env:HOMEDRIVE)) {
+        if ($v -and ([string]$v).Trim()) {
+            $s = ([string]$v).Trim()
+            # HOMEDRIVE 单独用没有意义（如 'C:'），跳过
+            if ($s.Length -le 2 -and $s -match '^[A-Za-z]:$') { continue }
+            return $s
+        }
+    }
+    try {
+        $h = [Environment]::GetFolderPath('UserProfile')
+        if ($h -and $h.Trim()) { return $h }
+    } catch { }
+    return (Get-Location).Path
+}
+
+$script:piHomeDir = Get-PiHomeDir
 if (-not $script:piSessionsRoot) {
-    $script:piSessionsRoot = Join-Path $env:USERPROFILE '.pi\agent\sessions'
+    $script:piSessionsRoot = Join-Path $script:piHomeDir '.pi/agent/sessions'
 }
 if (-not $script:piStateFile) {
-    $script:piStateFile = Join-Path $env:USERPROFILE '.pi\agent\kun-pet-state.json'
+    $script:piStateFile = Join-Path $script:piHomeDir '.pi/agent/kun-pet-state.json'
 }
 # 扩展状态文件的新鲜度窗口（扩展每 5s 心跳重写一次）
 if (-not $script:piStateFileFreshSec) { $script:piStateFileFreshSec = 30 }
@@ -443,6 +467,31 @@ function Get-PiFileState($file) {
     }
 }
 
+# 数一个目录在 root 之下有几层（root 自己 = 0，直接子目录 = 1，以此类推）。
+# 不在 root 之下时返回 -1。
+#
+# 为什么不用 Substring：那要求两个字符串长度严格对齐。真实踩过的坑——
+# 路径里出现 8.3 短名（同一目录的长名与 ~1 短名混用）时，Substring 会切错位置，
+# 相对路径变成 'sions\proj\a.jsonl'，层级算错 → 会话被静默跳过（整体失效）。
+# 这里改成从目录**向上逐级比对**父目录，用 .NET 规范化后的 FullName 比较，与长度无关。
+function Get-PiLevelsBelowRoot($dir, [string]$rootFull) {
+    try {
+        if ($null -eq $dir) { return -1 }
+        $cur = [System.IO.DirectoryInfo]$dir
+        $levels = 0
+        while ($null -ne $cur) {
+            $curFull = $cur.FullName.TrimEnd('\', '/')
+            if ([string]::Equals($curFull, $rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $levels
+            }
+            $levels++
+            $cur = $cur.Parent
+            if ($levels -gt 64) { break }   # 防御：异常深的路径直接放弃
+        }
+        return -1
+    } catch { return -1 }
+}
+
 # ---------------- 判定：单个会话是「在跑」还是「已收尾」 ----------------
 # 返回 @{ running; mode; reason }。mode 只用桌宠已有的词汇。
 function Get-PiSessionVerdict($state) {
@@ -513,11 +562,18 @@ function Get-StateFromPiSessions {
         # 这里刻意**不再**按 cwd 去重 —— 那是我最初的错误做法：它会把「同一项目目录下
         # 开了多个 pi 窗口」误判成子代理，只显示一个任务。多窗口恰恰是常见用法。
         $sessionFiles = New-Object System.Collections.ArrayList
+        $rootFull = ([System.IO.DirectoryInfo]$script:piSessionsRoot).FullName.TrimEnd('\', '/')
         foreach ($f in $all) {
-            $rel = $f.FullName.Substring($script:piSessionsRoot.Length).TrimStart('\', '/')
-            $depth = @($rel -split '[\\/]').Count      # 根/目录/文件 = 3 段 → 深度 2
-            if ($depth -gt 2) {
-                Write-Log ('pi source: skipped nested session file (likely subagent artifact): {0}' -f $rel)
+            # 用「向上走父目录」算层级，**不要**用 Substring($root.Length)：
+            # 后者假设两边字符串长度完全一致，一旦路径被规范化过就会错位 ——
+            # 例如 8.3 短名（ADMINI~1 vs Administrator）、尾斜杠、符号链接。
+            # 实测踩过：Substring 多切了 6 个字符，相对路径成了 'sions\proj\a.jsonl'，
+            # 段数算成 3 → 该文件被当成子代理产物**静默跳过**（功能整体失效）。
+            # 让 .NET 自己规范化两边再比，就不会有这个问题。
+            $levels = Get-PiLevelsBelowRoot $f.Directory $rootFull
+            if ($levels -lt 0 -or $levels -gt 1) {
+                # levels<0：不在 root 下（异常情况）；levels>1：在子目录里 → 子代理产物
+                Write-Log ('pi source: skipped nested session file (likely subagent artifact): {0}' -f $f.FullName)
                 continue
             }
             [void]$sessionFiles.Add($f)
