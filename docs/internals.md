@@ -126,7 +126,7 @@ Windows PowerShell 5.1 对**没有 BOM** 的 `.ps1` 按系统 ANSI 代码页（�
 | `tests/test-update.ps1` | 更新的单元：版本比较、清单白名单（防穿越）、内容校验（挡 HTML/BOM）、原子替换、备份、回滚、**清单完整性守护** | 76 项 |
 | `tests/test-update-flow.ps1` | **更新全流程**（假网络 + 真磁盘）：有新版则装、已最新则不动、坏内容拒装、清单投毒只装白名单 | 22 项 |
 | `tests/test-update-real.ps1` | 从**真实 GitHub** 取文件并走完整校验与落盘（需联网，人工核对用） | — |
-| `tests/test-notice.ps1` | 气泡提示的优先级与过期（直接调 `Resolve-BubbleText`，含坏输入不抛异常） | 14 项 |
+| `tests/test-notice.ps1` | 气泡提示的优先级与过期（直接调 `Resolve-BubbleText`，含坏输入不抛异常） | 15 项 |
 | `tests/test-update-live.ps1` | 用**真实 GitHub 源**跑一次完整更新（人工核对用，会把临时目录从 2.0.0 升到最新） | — |
 
 接入层单独测是有意的：模块自己测通了，不代表 `kun-pet-desktop.ps1` 里那段仲裁写对了。

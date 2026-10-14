@@ -57,6 +57,26 @@
 > 不需要 PowerShell 7。若你机器上 `powershell.exe` 被安全策略限制，用
 > `powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\kun-pet-desktop.ps1` 手动跑一次即可看到完整报错。
 
+### 全新用户要注意的三件事（都已实测）
+
+**1. 用 `启动桌宠.vbs` 启动，不要直接双击 `.ps1`。**
+`.vbs` 内部自带 `-ExecutionPolicy Bypass`，所以**即使你的系统策略是 `Restricted` 也能起来**
+（实测通过）。反过来，直接运行 `.ps1` 在 `Restricted` 下会被拒：
+
+```
+File ...\kun-pet-desktop.ps1 cannot be loaded because running scripts is disabled on this system.
+```
+
+**2. 不装任何素材也能用。** 没有 `~/.petdex/pets/` 时，桌宠会退回**内置矢量形象**，
+照常显示、拖动、跟随任务，不会报错。想换成像素形象见 [装形象素材](#装形象素材换皮肤)。
+
+**3. 没有 DSH、没有 pi 也不影响启动。** 桌宠会以待机动画待在桌面上（单击挥手、
+双击跳一下、拖动移动），只是不显示任务进展气泡。相关日志会明确写「找不到，已进入空闲态」，
+不会崩。
+
+> 以上三点都在「干净用户目录（无 `.petdex`、无 `.pi`）」与「系统策略 Restricted」
+> 两种环境下实际启动验证过，不是推测。
+
 ---
 
 ## 快速开始
@@ -457,10 +477,10 @@ Copy-Item .\pi-extension\kun-pet.ts $dest -Force
 ### 自测（不需要真的开 pi）
 
 ```powershell
-# 1) 纯逻辑 + 夹具（56 项）
+# 1) 纯逻辑 + 夹具（66 项）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-source.ps1
 
-# 2) 接入与多源仲裁（25 项）：dot-source、并列显示、等待优先、过期快照、开关
+# 2) 接入与多源仲裁（31 项）：dot-source、并列显示、等待优先、过期快照、开关
 powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-integration.ps1
 
 # 3) 拿本机**真实**的 ~/.pi/agent/sessions 跑一遍（只读）
