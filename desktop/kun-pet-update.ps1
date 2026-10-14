@@ -327,17 +327,28 @@ function Install-UpdateFiles($staged, [string]$targetDir, [string]$backupRoot, [
 # 这是给桌宠调用的入口。返回
 #   @{ ok; status; localVersion; remoteVersion; files; backupDir; error; notes }
 #   status: 'up-to-date' | 'updated' | 'failed'
-function Invoke-PetUpdate([string]$targetDir, [string]$currentVersion, [string]$backupRoot) {
+#
+# $fetcher 可选：一个 (url) => byte[] 的委托，用于**测试注入假网络**。
+# 为什么不靠「测试里重定义同名函数」来替换网络：PowerShell 的函数解析带作用域，
+# 在「模块被 dot-source 进来的脚本里重定义」和「CI 的 Linux + pwsh7」组合下
+# 行为不一致（本地通过、CI 失败，实测踩到过）。显式传参不依赖任何作用域规则。
+function Invoke-PetUpdate([string]$targetDir, [string]$currentVersion, [string]$backupRoot, $fetcher = $null) {
     $out = @{
         ok = $false; status = 'failed'; localVersion = [string]$currentVersion
         remoteVersion = ''; files = @(); backupDir = $null; error = ''; notes = @()
+    }
+    # 取字节：优先用注入的 fetcher，其次走真实网络
+    $fetch = {
+        param([string]$url, [int]$timeout)
+        if ($null -ne $fetcher) { return (& $fetcher $url $timeout) }
+        return (Get-UpdateBytes $url $timeout)
     }
     try {
         $base = [string]$script:updRawBase
         if (-not $base) { $out.error = '未配置更新源'; return $out }
 
         # 1) 取版本清单
-        $manifestBytes = Get-UpdateBytes ($base + '/desktop/version.json') 30
+        $manifestBytes = & $fetch ($base + '/desktop/version.json') 30
         if ($null -eq $manifestBytes -or $manifestBytes.Length -eq 0) {
             $out.error = '无法获取版本清单（网络不可达或更新源不可用）'
             return $out
@@ -366,7 +377,7 @@ function Invoke-PetUpdate([string]$targetDir, [string]$currentVersion, [string]$
         $staged = @{}
         foreach ($name in $names) {
             $url = $base + '/desktop/' + $name
-            $bytes = Get-UpdateBytes $url 30
+            $bytes = & $fetch $url 30
             if ($null -eq $bytes -or $bytes.Length -eq 0) {
                 $out.error = "下载失败：$name（已放弃本次更新，磁盘未改动）"
                 return $out

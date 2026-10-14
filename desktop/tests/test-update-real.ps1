@@ -28,7 +28,16 @@ Write-Host ""
 Write-Host "=== 3) 端到端：伪造一个「远端更新」在隔离目录跑完整流程 ==="
 # 用一个临时 raw 源（本地 HTTP 服务太麻烦）改为直接调 Install-UpdateFiles 验证替换；
 # 下载部分上面已验证。这里验证「下载到的真实字节 → 写入磁盘 → 内容与远端一致」。
-$tmp = Join-Path $env:TEMP ('kun-e2e-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+function Get-TestTempRoot {
+    foreach ($try in @(
+        { [IO.Path]::GetTempPath() },
+        { $env:TEMP }, { $env:TMP }, { $env:TMPDIR }
+    )) {
+        try { $v = & $try; if ($v -and ([string]$v).Trim()) { return ([string]$v).Trim() } } catch { }
+    }
+    return (Get-Location).Path
+}
+$tmp = Join-Path (Get-TestTempRoot) ('kun-e2e-' + [guid]::NewGuid().ToString('N').Substring(0,6))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 # 先放一个「旧版」
 foreach ($n in @('kun-pet-pi-source.ps1','kun-pet-wander.ps1')) {
