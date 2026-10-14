@@ -15,7 +15,6 @@
 - [这是什么](#这是什么)
 - [环境要求](#环境要求)
 - [快速开始](#快速开始)
-- [一键安装 / 卸载](#一键安装--卸载)
 - [功能一览](#功能一览)
 - [右键菜单](#右键菜单)
 - [装形象素材（换皮肤）](#装形象素材换皮肤)
@@ -67,6 +66,9 @@
 File ...\kun-pet-desktop.ps1 cannot be loaded because running scripts is disabled on this system.
 ```
 
+同样地，想一键安装就双击根目录的 **`安装.cmd`**（它也用 `-ExecutionPolicy Bypass`），
+而不是去双击 `install.ps1`。
+
 **2. 不装任何素材也能用。** 没有 `~/.petdex/pets/` 时，桌宠会退回**内置矢量形象**，
 照常显示、拖动、跟随任务，不会报错。想换成像素形象见 [装形象素材](#装形象素材换皮肤)。
 
@@ -81,37 +83,41 @@ File ...\kun-pet-desktop.ps1 cannot be loaded because running scripts is disable
 
 ## 快速开始
 
-### 方式 A：直接下载 ZIP（最简单）
+### 方式 A：下载 ZIP → 双击 `安装.cmd`（最省事，推荐给新用户）
 
-1. 本页右上角 **Code → Download ZIP**，解压到任意目录（例如 `D:\kun-desktop-pet`）。
-2. （推荐）把形象素材装进 petdex 目录，见 [装形象素材](#装形象素材换皮肤)。
-3. 双击 **`desktop\启动桌宠.vbs`**。
+1. 本页右上角 **Code → Download ZIP**，或到 GitHub 的 **Releases** 页下载，解压到任意目录（例如 `D:\kun-desktop-pet`）。
+2. 双击根目录的 **`安装.cmd`**。
 
-完成。桌宠会出现在桌面右下角附近。
+它会自动完成：装桌宠本体 → 装形象素材 → 装 DSH 插件 / pi 扩展（**装了对应程序才会装，没装就跳过**）→ 启动桌宠。
 
-### 方式 B：git clone
+> `安装.cmd` **不会**注册开机自启 —— 那应该是你自己的选择，不该是双击一次的副作用。
+> 需要自启请见 [可选：开机自启](#可选开机自启)。
+
+### 方式 B：下载 ZIP → 直接启动（不安装，最轻量）
+
+1. 解压后，双击 **`desktop\启动桌宠.vbs`**。
+
+不复制任何文件、不写注册表，就在原地跑起来。适合只想先看看效果。
+
+### 方式 C：git clone
 
 ```powershell
 git clone https://github.com/ddldydd/kun-desktop-pet.git
 cd kun-desktop-pet
-.\desktop\启动桌宠.vbs     # 直接启动
+.\desktop\启动桌宠.vbs          # 直接启动
+.\安装.cmd                      # 或走一键安装
 ```
 
-### 方式 C：一键安装（推荐给想「装到固定目录 + 素材 + 自启」的人）
+### 方式 D：命令行一键安装（想自定义参数时）
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-它会：
-
-1. 把桌宠复制到 `%USERPROFILE%\kun-desktop-pet`（固定目录，与自启脚本一致，配置文件不会被拆成两份）；
-2. 把 `assets/pets/*` 安装到 `%USERPROFILE%\.petdex\pets\`（已存在的同名素材**不会**被覆盖）；
-3. 可选装 DSH 插件、可选注册开机自启（用开关控制，见下）。
-
-常用参数：
+它做的事与 `安装.cmd` 相同，但默认**不**装插件/扩展、**不**启动；用开关控制：
 
 ```powershell
+.\install.ps1 -Recommended               # 等同双击 安装.cmd（素材+插件+扩展+启动）
 .\install.ps1 -Autostart                 # 顺带注册开机自启
 .\install.ps1 -InstallPlugin             # 顺带装 DSH 插件（默认 profile: desktop）
 .\install.ps1 -InstallPlugin -Profile web

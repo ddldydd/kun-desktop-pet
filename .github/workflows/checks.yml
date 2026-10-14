@@ -18,7 +18,8 @@ jobs:
         run: |
           set -e
           fail=0
-          for f in desktop/*.bat desktop/*.vbs tools/autostart/*.cmd; do
+          # 根目录的 安装.cmd 也要查：cmd.exe 对 LF 结尾的 .cmd 会出错
+          for f in 安装.cmd desktop/*.bat desktop/*.vbs tools/autostart/*.cmd; do
             if [ -f "$f" ]; then
               if ! grep -q $'\r' "$f"; then
                 echo "::error file=$f::应为 CRLF 行尾（.gitattributes 已声明，请检查是否被改写）"
@@ -27,6 +28,56 @@ jobs:
             fi
           done
           exit $fail
+
+      - name: 双击入口必须是纯 ASCII（cmd.exe 按 OEM 代码页解码 .cmd）
+        run: |
+          set -e
+          fail=0
+          # .cmd/.bat 的**内容**若含非 ASCII 字节，在中文 Windows（GBK 控制台）下
+          # 会被解码成乱码甚至改变语义。文件名可以是中文，内容必须纯 ASCII。
+          # 这是实测踩过的坑（写文件时用 ASCIIEncoding 会把中文静默变成 '????'）。
+          for f in 安装.cmd desktop/*.bat tools/autostart/*.cmd; do
+            if [ -f "$f" ]; then
+              if LC_ALL=C grep -qP '[\x80-\xFF]' "$f"; then
+                echo "::error file=$f::.cmd/.bat 内容含非 ASCII 字节，请在中文 Windows 上会乱码"
+                fail=1
+              fi
+            fi
+          done
+          exit $fail
+
+      - name: 安装入口与 install.ps1 的契约（-Recommended 必须存在）
+        shell: pwsh
+        run: |
+          # 双击入口靠 install.ps1 的 -Recommended 承载「推荐默认值」。
+          # 若哪天有人删了这个开关，入口会静默地什么都不做 —— 用 CI 钉住。
+          $fail = 0
+          $entry = './安装.cmd'
+          if (-not (Test-Path $entry)) {
+            Write-Host "::error::根目录缺少 安装.cmd（双击入口）"
+            exit 1
+          }
+          $entryText = Get-Content $entry -Raw
+          if ($entryText -notmatch '-Recommended') {
+            Write-Host "::error::安装.cmd 没有传 -Recommended"
+            $fail = 1
+          }
+          # 只在**非注释行**里找 -Autostart：
+          # 注释里完全可能写「刻意不加 -Autostart 及原因」，那是好事，不该判失败。
+          $nonComment = ($entryText -split "`r?`n") |
+                        Where-Object { $_ -notmatch '^\s*(rem\b|::)' }
+          $cmdLines = $nonComment -join "`n"
+          if ($cmdLines -match '-Autostart') {
+            Write-Host "::error::安装.cmd 不应默认注册开机自启（应由用户主动开启）"
+            $fail = 1
+          }
+          $ps1 = Get-Content ./install.ps1 -Raw
+          if ($ps1 -notmatch '\[switch\]\$Recommended') {
+            Write-Host "::error::install.ps1 里没有 -Recommended 开关（入口依赖它）"
+            $fail = 1
+          }
+          if ($fail -ne 0) { exit 1 }
+          Write-Host "安装入口契约检查通过"
 
       - name: 不要提交绝对路径 / 运行期产物
         run: |

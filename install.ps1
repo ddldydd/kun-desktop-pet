@@ -40,8 +40,28 @@ param(
     [switch]$Force,
 
     # 装完立刻启动桌宠
-    [switch]$Start
+    [switch]$Start,
+
+    # 「推荐默认值」：给双击入口（根目录的 安装.cmd）用。
+    # 一次性打开：装素材 + 装插件/扩展（存在才装）+ 装完启动。
+    #
+    # 为什么不直接在 .cmd 里写 -InstallPlugin -InstallPiExtension：
+    # 那样一旦用户自己再传一次同名开关，PowerShell 会直接报
+    # 「无法绑定参数，因为参数 InstallPlugin 指定了多次」——
+    # 报错信息对普通用户完全看不懂（实测踩到过）。
+    # 用一个独立开关承载默认值，就永远不会和用户的参数撞车。
+    #
+    # 刻意**不**包含 -Autostart：往开机启动项里写东西应该是用户的明确选择，
+    # 而不是双击一次的副作用。
+    [switch]$Recommended
 )
+
+# -Recommended 展开成推荐默认值（在参数校验之前完成）
+if ($Recommended) {
+    $Start = $true
+    $InstallPlugin = $true
+    $InstallPiExtension = $true
+}
 
 $ErrorActionPreference = 'Stop'
 
