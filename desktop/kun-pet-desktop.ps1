@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.1.0'
+    Version     = '2.2.0'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -529,6 +529,14 @@ $state = [hashtable]::Synchronized(@{
     wanderTargetY = $null
     wanderRestUntil = [datetime]::MinValue   # 走到目标后歇到什么时候
     wanderLastDir = 'running-right'
+    # ---- 临时提示（走气泡，不走弹窗）----
+    # 为什么用气泡而不是 MessageBox：实测过（见 docs/internals.md）——
+    # WinForms 的 MessageBox **不带 Topmost**，而桌宠本身是 Topmost，
+    # 于是那个对话框会出现在**桌宠之下**，可能被挡住；而且它会抢焦点打断你打字。
+    # 气泡贴在置顶的桌宠上，天然总在最上层，且不打断任何操作。
+    # noticeText 非空时优先显示；noticeUntil 到期自动消失。
+    noticeText = ''
+    noticeUntil = [datetime]::MinValue
 })
 
 $script:tickErrors = 0
@@ -949,6 +957,29 @@ try {
     }
 } catch {
     Write-Log ('wander module failed to load: ' + $_.Exception.Message)
+}
+
+# ---------------- 纯 UI 辅助（可自测） ----------------
+# 只放不碰 WPF 对象的纯函数，例如「气泡该显示什么」（含临时提示的优先级与过期）。
+# 放模块里是为了能被测试**直接调用产品代码**，而不是在测试里复制一份逻辑
+# —— 复制品会随产品代码失真而测试照样全绿。
+$script:uiModuleLoaded = $false
+try {
+    $script:uiModulePath = Join-Path $script:logDir 'kun-pet-ui.ps1'
+    if (Test-Path -LiteralPath $script:uiModulePath) {
+        . $script:uiModulePath
+        $script:uiModuleLoaded = $true
+    } else {
+        Write-Log ('ui module not found ({0})' -f $script:uiModulePath)
+    }
+} catch {
+    Write-Log ('ui module failed to load: ' + $_.Exception.Message)
+}
+# 模块缺失时的兜底：至少保证气泡还能按常态显示，不至于整只宠物崩掉
+if (-not (Get-Command -Name 'Resolve-BubbleText' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Resolve-BubbleText([string]$normalText, [string]$noticeText, $noticeUntil, $now) {
+        return @{ bubble = [string]$normalText; noticeText = [string]$noticeText }
+    }
 }
 
 # ---------------- 更新模块（检查更新 / 一键更新） ----------------
@@ -1701,6 +1732,27 @@ function Set-Action([string]$action, [int]$holdMs) {
     $state.frameAt = Get-Date
 }
 
+# 在气泡里显示一条**临时提示**（几秒后自动消失）。
+#
+# 为什么不用 MessageBox（实测结论，见 docs/internals.md）：
+#   WinForms 的 MessageBox **不是 Topmost**，而桌宠是 Topmost 窗口，
+#   于是对话框会出现在桌宠**之下**、可能被挡住；而且它会抢焦点，打断你正在打的字。
+#   气泡贴在置顶的桌宠上，天然总在最上层，且完全不打断操作。
+#
+# 顺带：提示在「暂停」时也要能看到（暂停只冻结小宠动画，气泡照常刷新），
+# 所以这里不检查 paused。
+function Show-Notice([string]$text, [int]$seconds = 8) {
+    try {
+        if (-not $text) { return }
+        $state.noticeText = [string]$text
+        $state.noticeUntil = (Get-Date).AddSeconds($seconds)
+        # 顺手抬一下存在感：小宠闪一下（与「需要你介入」同一套视觉语言）
+        $state.alertFlashUntil = (Get-Date).AddSeconds(2)
+    } catch {
+        Note-TickError 'show-notice' $_
+    }
+}
+
 function Set-Mode([string]$mode) {
     if ($state.mode -eq $mode) { return }
     $prevMode = $state.mode
@@ -2156,22 +2208,22 @@ $miUpdate = [System.Windows.Forms.ToolStripMenuItem]::new('检查更新…')
 $miUpdate.add_Click({
     try {
         if (-not $script:updateModuleLoaded) {
-            [System.Windows.Forms.MessageBox]::Show(
-                '更新模块未加载（kun-pet-update.ps1 缺失），无法检查更新。',
-                'Kun Like 桌宠', 'OK', 'Warning') | Out-Null
+            Show-Notice '⚠ 更新模块未加载，无法检查更新' 8
+            Write-Log 'update check: module not loaded'
             return
         }
         $cur = Get-PetVersion
         $miUpdate.Enabled = $false
         $miUpdate.Text = '正在检查更新…'
+        # 先给个即时反馈：联网比对有几秒延迟，不能让你以为点了没反应
+        Show-Notice ("🔍 正在检查更新…`n当前版本 v$cur") 20
         try {
             # 取远端清单（只下载一个很小的 version.json）
             $base = Get-UpdateSource
             $bytes = Get-UpdateBytes ($base + '/desktop/version.json') 20
             if ($null -eq $bytes -or $bytes.Length -eq 0) {
-                [System.Windows.Forms.MessageBox]::Show(
-                    "无法连接更新源，请检查网络。`n`n源：$base",
-                    '检查更新失败', 'OK', 'Warning') | Out-Null
+                Show-Notice "⚠ 连不上更新源，请检查网络`n（源：$base）" 10
+                Write-Log 'update check: source unreachable'
                 return
             }
             $text = [System.Text.Encoding]::UTF8.GetString($bytes)
@@ -2179,45 +2231,60 @@ $miUpdate.add_Click({
             $manifest = $null
             try { $manifest = $text | ConvertFrom-Json } catch { }
             if ($null -eq $manifest) {
-                [System.Windows.Forms.MessageBox]::Show('更新源返回的版本清单不是合法 JSON。', '检查更新失败', 'OK', 'Warning') | Out-Null
+                Show-Notice '⚠ 更新源返回的版本清单不是合法 JSON' 10
+                Write-Log 'update check: bad manifest json'
                 return
             }
             $remote = Get-ManifestVersion $manifest
+
+            # ---- 已是最新：走**气泡**提示 ----
+            # 实测过：WinForms 的 MessageBox 不是 Topmost，而桌宠是 Topmost，
+            # 于是弹窗会出现在桌宠**之下**、可能被挡住，还会抢焦点打断你打字。
+            # 气泡贴在置顶的小宠上，一定看得见，也完全不打扰。
             if (-not (Test-UpdateNewer $cur $remote)) {
-                [System.Windows.Forms.MessageBox]::Show(
-                    "已是最新版本。`n`n当前版本：$cur",
-                    'Kun Like 桌宠', 'OK', 'Information') | Out-Null
+                Show-Notice ("✅ 已是最新版本 v$cur`n无需更新") 8
                 Write-Log ("update check: up-to-date (local=$cur remote=$remote)")
                 return
             }
 
-            # 有新版本 → 让用户确认
+            # ---- 有新版本：这是**不可逆操作**（会替换程序文件），所以仍然要弹窗确认 ----
+            # 但用 WPF 的 MessageBox 并指定桌宠窗口为 owner —— 实测这种才有 Topmost，
+            # 能确保盖在置顶的小宠之上（WinForms 那两种都落在桌宠下面）。
             $notes = ''
             try { if ($manifest.notes) { $notes = (@($manifest.notes) | ForEach-Object { '· ' + $_ }) -join "`n" } } catch { }
-            $msg = "发现新版本！`n`n当前：$cur`n最新：$remote`n`n"
+            $msg = "发现新版本！`n`n当前：v$cur`n最新：v$remote`n`n"
             if ($notes) { $msg += "本次更新内容：`n$notes`n`n" }
-            $msg += "现在更新吗？`n（更新会替换桌宠程序文件，并保留你的设置与形象；`n  旧版本会自动备份，可回滚）"
-            $choice = [System.Windows.Forms.MessageBox]::Show($msg, '发现新版本', 'YesNo', 'Question')
-            if ($choice -ne 'Yes') {
+            $msg += "现在更新吗？`n（会替换桌宠程序文件，保留你的设置与形象；旧版本自动备份，可回滚）"
+            $choice = 'No'
+            try {
+                $choice = [System.Windows.MessageBox]::Show(
+                    $window, $msg, 'Kun Like 桌宠 · 发现新版本',
+                    [System.Windows.MessageBoxButton]::YesNo,
+                    [System.Windows.MessageBoxImage]::Question)
+            } catch {
+                # 极端情况（窗口还没句柄等）：退回 WinForms 弹窗，至少不会中断流程
+                $choice = [System.Windows.Forms.MessageBox]::Show($msg, '发现新版本', 'YesNo', 'Question')
+            }
+            if ([string]$choice -ne 'Yes') {
+                Show-Notice ("已跳过更新`n仍为 v$cur") 6
                 Write-Log ("update check: declined (local=$cur remote=$remote)")
                 return
             }
 
-            # 执行更新
+            # ---- 执行更新 ----
             Write-Log ("update: start (local=$cur remote=$remote)")
+            Show-Notice ("⬇ 正在更新到 v$remote…`n请稍候") 60
             $r = Invoke-PetUpdate $script:logDir $cur $script:logDir
             if ($r.ok -and $r.status -eq 'updated') {
-                $body = "已更新到 $remote ✓`n`n更动文件 $((@($r.files)).Count) 个。`n现在重启桌宠以应用更新。"
-                if ($r.backupDir) { $body += "`n`n旧版本备份在：`n$($r.backupDir)" }
-                [System.Windows.Forms.MessageBox]::Show($body, '更新成功', 'OK', 'Information') | Out-Null
                 Write-Log ("update: ok, replaced " + ((@($r.files)) -join ','))
+                Show-Notice ("🎉 已更新到 v$remote`n共 $((@($r.files)).Count) 个文件，即将重启") 30
+                # 让提示在重启前留一会儿，用户能看到「更新成功」
+                Start-Sleep -Milliseconds 1200
                 Restart-Pet
             } else {
                 $err = $r.error
                 if (-not $err) { $err = "状态：$($r.status)" }
-                [System.Windows.Forms.MessageBox]::Show(
-                    "更新未完成，磁盘内容保持原样：`n`n$err",
-                    '更新失败', 'OK', 'Warning') | Out-Null
+                Show-Notice ("⚠ 更新失败，文件保持原样`n" + (Limit-Text $err 60)) 15
                 Write-Log ("update: failed - " + $err)
             }
         } finally {
@@ -2226,9 +2293,7 @@ $miUpdate.add_Click({
         }
     } catch {
         Note-TickError 'check-update' $_
-        try {
-            [System.Windows.Forms.MessageBox]::Show(("检查更新出错：`n" + $_.Exception.Message), 'Kun Like 桌宠', 'OK', 'Warning') | Out-Null
-        } catch { }
+        Show-Notice ('⚠ 检查更新出错：' + (Limit-Text $_.Exception.Message 50)) 12
     }
 })
 $menu.Items.Add($miUpdate) | Out-Null
@@ -2825,6 +2890,12 @@ $animTimer.Add_Tick({
             if ($BubbleMap.ContainsKey($action)) { $bubbleValue = $BubbleMap[$action] }
             if ($action -eq 'idle' -and $state.mode -eq 'disconnected') { $bubbleValue = $BubbleMap['disconnected'] }
         }
+        # 临时提示（检查更新的结果等）**优先级最高**：它是有时效的操作反馈，
+        # 必须盖过「等待介入」「进行中」这些常态文案，否则用户点了菜单却看不到回应。
+        # 判断逻辑在 kun-pet-ui.ps1 里（纯函数，可自测，测试直接调它）。
+        $rb = Resolve-BubbleText $bubbleValue $state.noticeText $state.noticeUntil (Get-Date)
+        $bubbleValue = $rb.bubble
+        if ([string]$state.noticeText -ne [string]$rb.noticeText) { $state.noticeText = $rb.noticeText }
         if ($bubbleTextEl.Text -ne $bubbleValue) { $bubbleTextEl.Text = $bubbleValue }
 
         # 等待提示换配色：提问=琥珀，审批=绿（与面板上的 ✓/✗ 呼应）

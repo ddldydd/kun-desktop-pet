@@ -178,5 +178,45 @@ try {
 }
 
 Write-Host ""
+Write-Host "=== 7. 守护：desktop/ 下每个文件都必须能被更新到 ===" -ForegroundColor Cyan
+# 这条守护来自一个真实疏漏：新增了 kun-pet-ui.ps1，却忘了把它加进更新白名单
+# 与 version.json 的 files 清单 —— 结果用户更新后会得到一个「引用了没被下载的
+# 文件」的桌宠。这种错只能靠自动检查发现，人眼很容易漏。
+$testsDir = $PSScriptRoot
+if (-not $testsDir) { $testsDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$desktopDir = Split-Path -Parent $testsDir
+$vjPath = Join-Path $desktopDir 'version.json'
+CheckTrue 'version.json 存在' (Test-Path -LiteralPath $vjPath)
+if (Test-Path -LiteralPath $vjPath) {
+    $vjText = [IO.File]::ReadAllText($vjPath, [Text.Encoding]::UTF8)
+    if ($vjText.Length -gt 0 -and $vjText[0] -eq [char]0xFEFF) { $vjText = $vjText.Substring(1) }
+    $vj = $null
+    try { $vj = $vjText | ConvertFrom-Json } catch { }
+    CheckTrue 'version.json 是合法 JSON' ($null -ne $vj)
+    if ($null -ne $vj) {
+        $manifestFiles = @(Get-ManifestFiles $vj)
+        $onDisk = @(Get-ChildItem -LiteralPath $desktopDir -File | Select-Object -ExpandProperty Name)
+        # ① 磁盘上每个文件都应出现在清单里（漏了就不会被更新）
+        foreach ($f in $onDisk) {
+            CheckTrue ("desktop/ 的文件在更新清单里: " + $f) ($manifestFiles -contains $f)
+        }
+        # ② 清单里每个文件都应真实存在（否则下载必失败 → 更新整体放弃）
+        foreach ($f in $manifestFiles) {
+            CheckTrue ("清单里的文件确实存在: " + $f) ($onDisk -contains $f)
+        }
+        # ③ 主脚本 dot-source 的模块必须都在清单里
+        $mainPath = Join-Path $desktopDir 'kun-pet-desktop.ps1'
+        if (Test-Path -LiteralPath $mainPath) {
+            $mainText = [IO.File]::ReadAllText($mainPath, [Text.Encoding]::UTF8)
+            foreach ($mod in @('kun-pet-pi-source.ps1', 'kun-pet-wander.ps1', 'kun-pet-update.ps1', 'kun-pet-ui.ps1')) {
+                if ($mainText.Contains($mod)) {
+                    CheckTrue ("被引用的模块在更新清单里: " + $mod) ($manifestFiles -contains $mod)
+                }
+            }
+        }
+    }
+}
+
+Write-Host ""
 if ($script:fail -eq 0) { Write-Host ("全部通过：{0} 项" -f $script:pass) -ForegroundColor Green; exit 0 }
 else { Write-Host ("失败 {0} 项 / 通过 {1} 项" -f $script:fail, $script:pass) -ForegroundColor Red; exit 1 }

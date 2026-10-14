@@ -123,9 +123,11 @@ Windows PowerShell 5.1 对**没有 BOM** 的 `.ps1` 按系统 ANSI 代码页（�
 | `tests/test-pi-source-real.ps1` | 拿本机**真实** `~/.pi/agent/sessions` 只读跑一遍（人工核对输出） | — |
 | `tests/test-wander.ps1` | 随机移动的几何：选点 / 步进 / 夹取 / 区间随机 | 26 项 |
 | `tests/test-wander-guards.ps1` | 随机移动的**守卫**（直接调产品代码里的 `Test-WanderAllowed`） | 14 项 |
-| `tests/test-update.ps1` | 更新的单元：版本比较、清单白名单（防穿越）、内容校验（挡 HTML/BOM）、原子替换、备份、回滚 | 52 项 |
+| `tests/test-update.ps1` | 更新的单元：版本比较、清单白名单（防穿越）、内容校验（挡 HTML/BOM）、原子替换、备份、回滚、**清单完整性守护** | 76 项 |
 | `tests/test-update-flow.ps1` | **更新全流程**（假网络 + 真磁盘）：有新版则装、已最新则不动、坏内容拒装、清单投毒只装白名单 | 22 项 |
 | `tests/test-update-real.ps1` | 从**真实 GitHub** 取文件并走完整校验与落盘（需联网，人工核对用） | — |
+| `tests/test-notice.ps1` | 气泡提示的优先级与过期（直接调 `Resolve-BubbleText`，含坏输入不抛异常） | 14 项 |
+| `tests/test-update-live.ps1` | 用**真实 GitHub 源**跑一次完整更新（人工核对用，会把临时目录从 2.0.0 升到最新） | — |
 
 接入层单独测是有意的：模块自己测通了，不代表 `kun-pet-desktop.ps1` 里那段仲裁写对了。
 集成测试把主脚本的仲裁分支**逐条重放**，包括「DSH 与 pi 同时在跑 → 并列显示」和
@@ -221,6 +223,34 @@ https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main/desktop/<file>
 `$Config.Version`（读不到 version.json 时用）。两者不一致会导致
 「每次启动都提示有新版却永远装不上」或「明明有新版却说已是最新」。
 CI 里加了一步专门校验两者相等。
+
+---
+
+### 提示走气泡，不走弹窗（实测结论）
+
+「检查更新」的结果原本用 `MessageBox` 提示。实测发现**用户可能看不到**：
+
+| 写法 | 是否 Topmost | 相对桌宠的 z 序 |
+|---|---|---|
+| WinForms `MessageBox`（不传 owner） | ❌ `topmost=False` | **在桌宠之下** |
+| WinForms `MessageBox`（传 owner） | ❌ `topmost=False` | **在桌宠之下** |
+| WPF `MessageBox`（传 WPF Window 作 owner） | ✅ `topmost=True` | 在桌宠之上 |
+
+桌宠本身是 **Topmost** 窗口，所以前两种弹窗会落在它**下面**，可能被挡住；
+而且弹窗会**抢焦点**，打断用户正在打的字。
+
+所以：**结果提示一律走气泡**（贴在置顶的小宠上，一定看得见，且完全不打断操作），
+只有**不可逆操作**（真的要替换程序文件）才弹窗确认，且用 WPF 那种（带 Topmost）。
+
+气泡提示的优先级判断放在 `kun-pet-ui.ps1` 的 `Resolve-BubbleText`（纯函数，可自测）。
+它**优先级最高**，必须盖过「等待介入」「进行中」这些常态文案 ——
+否则任务正好在跑时点了菜单，气泡被进展占着，用户依然看不到回应。
+
+运行时实测（真实点菜单 → 读窗口上气泡控件的实际文字）：
+```
+  1489 ms  ✅ 已是最新版本 v2.1.0 / 无需更新
+  9647 ms  我先去干活啦！          ← 8 秒后自动消失，回到常态
+```
 
 ---
 

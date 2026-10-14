@@ -110,6 +110,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::更新模块测试失败"; $fail = 1 }
           & ./desktop/tests/test-update-flow.ps1 ./desktop
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::更新流程测试失败"; $fail = 1 }
+          & ./desktop/tests/test-notice.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::气泡提示测试失败"; $fail = 1 }
           if ($fail -ne 0) { exit 1 }
 
       - name: 版本号一致性（desktop/version.json 与脚本内兜底值）

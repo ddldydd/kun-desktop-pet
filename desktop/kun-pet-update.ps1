@@ -38,6 +38,7 @@ if (-not $script:updAllowedFiles) {
         'kun-pet-pi-source.ps1',
         'kun-pet-wander.ps1',
         'kun-pet-update.ps1',
+        'kun-pet-ui.ps1',
         'version.json',
         '启动桌宠.vbs',
         '启动桌宠.bat',
