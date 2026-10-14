@@ -515,6 +515,14 @@ $state = [hashtable]::Synchronized(@{
     questionApprove = ''
     gapPx = -18
     floating = $true
+    # ---- 随机移动（到处跑）----
+    # wanderEnabled: 是否让小宠自己在桌面上溜达（右键菜单开关，持久化）
+    # 默认**关**：宠物自己会动是有打扰性的，必须由用户主动开启。
+    wanderEnabled = $false
+    wanderTargetX = $null      # 当前目标点（$null = 需要挑一个新的）
+    wanderTargetY = $null
+    wanderRestUntil = [datetime]::MinValue   # 走到目标后歇到什么时候
+    wanderLastDir = 'running-right'
 })
 
 $script:tickErrors = 0
@@ -918,6 +926,23 @@ try {
 # 这样轮询里那句 $piSnap = Get-StateFromPi 不必到处写 if 判断。
 if (-not $script:piModuleLoaded -and -not (Get-Command -Name 'Get-StateFromPi' -CommandType Function -ErrorAction SilentlyContinue)) {
     function Get-StateFromPi { return $null }
+}
+
+# ---------------- 随机移动（到处跑）的纯函数模块 ----------------
+# 与 pi 模块同样单独成文件：几何计算（选点/步进/夹取）是纯函数，
+# 可以脱离 WPF 单独自测（tests/test-wander.ps1）。
+# 驱动窗口的那部分（Update-Wander）留在本文件，因为它要访问 $window/$state。
+$script:wanderModuleLoaded = $false
+try {
+    $script:wanderModulePath = Join-Path $script:logDir 'kun-pet-wander.ps1'
+    if (Test-Path -LiteralPath $script:wanderModulePath) {
+        . $script:wanderModulePath
+        $script:wanderModuleLoaded = $true
+    } else {
+        Write-Log ('wander module not found; random movement disabled ({0})' -f $script:wanderModulePath)
+    }
+} catch {
+    Write-Log ('wander module failed to load: ' + $_.Exception.Message)
 }
 
 Function Get-StateFromHarness {
@@ -1499,6 +1524,8 @@ function Save-Settings {
             # pi 兼容开关：默认开。存的就是「是否启用」，读的时候用 $null -ne 判断存在性，
             # 避免把「用户主动关掉」误判成「没保存过」而自动打开（petId 踩过同样的坑）。
             piEnabled = [bool]$state.piEnabled
+            # 随机移动：默认关，同样用「字段是否存在」判断（见 Load-Settings）
+            wander = [bool]$state.wanderEnabled
             posLeft = [double]$window.Left
             posTop  = [double]$window.Top
             # 窗口是 SizeToContent：尺寸随气泡文字变，只存左上角的话，
@@ -1554,6 +1581,11 @@ function Load-Settings {
         if ($null -ne $saved.piEnabled) {
             $state.piEnabled = [bool]$saved.piEnabled
             if ($script:piModuleLoaded) { Set-PiEnabled $state.piEnabled }
+        }
+        # 随机移动：同一个坑，同样用「字段是否存在」判断。
+        # 默认关；只有明确存了 true 才开。
+        if ($null -ne $saved.wander) {
+            $state.wanderEnabled = [bool]$saved.wander
         }
         if ($saved.posLeft -and $saved.posTop) {
             $screenW = [System.Windows.SystemParameters]::PrimaryScreenWidth
@@ -2026,6 +2058,34 @@ $miFloat.add_Click({
 })
 $menu.Items.Add($miFloat) | Out-Null
 
+# 随机移动（到处跑）开关。默认关：宠物自己会动是有打扰性的，必须用户主动开。
+# 关掉的那一刻如果正走在半路，会把目标清掉，让它立刻停在原地。
+$miWander = [System.Windows.Forms.ToolStripMenuItem]::new('到处跑（随机移动）')
+$miWander.Checked = $false
+$miWander.add_Click({
+    try {
+        $state.wanderEnabled = -not $state.wanderEnabled
+        $miWander.Checked = $state.wanderEnabled
+        if (-not $state.wanderEnabled) {
+            # 停：清掉目标与朝向，避免残留状态让它「抖」一下
+            $state.wanderTargetX = $null
+            $state.wanderTargetY = $null
+            $state.wanderLastDir = 'idle'
+            $state.wanderRestUntil = [datetime]::MinValue
+        } else {
+            # 开：从「歇着」状态起步，下一帧就会自己挑目标
+            $state.wanderRestUntil = [datetime]::MinValue
+            $state.wanderTargetX = $null
+            $state.wanderTargetY = $null
+        }
+        Write-Log ('wander ' + $(if ($state.wanderEnabled) { 'enabled' } else { 'disabled' }))
+        Save-Settings
+    } catch {
+        Note-TickError 'wander-toggle' $_
+    }
+})
+$menu.Items.Add($miWander) | Out-Null
+
 # pi coding agent 兼容开关：关掉后桌宠完全不理 pi（只跟 DSH），
 # 适合「不想看到 pi 的任务混进来」的场景。持久化到 kun-pet-settings.json。
 $miPi = [System.Windows.Forms.ToolStripMenuItem]::new('兼容 pi coding agent')
@@ -2079,7 +2139,6 @@ $miReset.add_Click({
     } catch { }
 })
 $menu.Items.Add($miReset) | Out-Null
-
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $miExit = [System.Windows.Forms.ToolStripMenuItem]::new('退出')
 $miExit.add_Click({
@@ -2197,6 +2256,9 @@ $miFloat.Checked = [bool]$state.floating
 $miPi.Checked = [bool]$state.piEnabled
 if ($script:piModuleLoaded) { Set-PiEnabled $state.piEnabled }
 Write-Log ('pi compatibility: ' + $(if ($state.piEnabled) { 'enabled' } else { 'disabled' }))
+# 随机移动开关的勾选同样要跟着设置走
+$miWander.Checked = [bool]$state.wanderEnabled
+Write-Log ('wander: ' + $(if ($state.wanderEnabled) { 'enabled' } else { 'disabled' }) + $(if (-not $script:wanderModuleLoaded) { ' (module missing!)' } else { '' }))
 # 启动时若处于暂停：先按当前状态画一帧，避免气泡停在上一个会话的旧文字或 "..."
 if ($state.paused) { Render-PausedFrame }
 
@@ -2378,6 +2440,79 @@ $pollTimer.Add_Tick({
 })
 $pollTimer.Start()
 
+# ---------------- 随机移动：驱动窗口 ----------------
+# 纯几何计算在 kun-pet-wander.ps1；这里负责「什么时候能动、每帧挪多少」。
+#
+# 为什么必须做这些「不动」的判断（否则会很难用）：
+#   1) 拖拽中：用户正抓着它，程序再去改 Left/Top 会跟鼠标打架、手感炸裂
+#   2) 暂停：暂停的语义是「冻结小宠」，这时候还满屏跑就自相矛盾
+#   3) 需要你介入（等审批 / 等回答）：审批面板上有 ✓/✗ 按钮，
+#      宠物一边飘一边等你点，按钮会跑掉，可能点错
+#   4) 鼠标悬停在宠物上：用户想点它 / 看清楚，这时别跑
+#   5) 鼠标穿透关闭时……不重要；穿透开着时本来就点不到，照常跑
+$script:wanderSpeed = 3.0          # 每帧像素（40ms/帧 → 约 75px/s，比走路慢一点，不吓人）
+$script:wanderRestMinMs = 1200     # 到达后最少歇多久
+$script:wanderRestMaxMs = 5000     # 最多歇多久
+$script:wanderHoverPause = $false  # 本帧鼠标是否停在宠物上（由 MouseEnter/Leave 维护）
+
+function Update-Wander {
+    try {
+        if (-not $script:wanderModuleLoaded) { return }
+        # 所有「什么时候不许动」的判断都集中在模块的 Test-WanderAllowed 里。
+        # 这样自测能直接验证那份逻辑本身，而不是验证一份可能走样的复制品。
+        $allowed = Test-WanderAllowed @{
+            enabled       = [bool]$state.wanderEnabled
+            paused        = [bool]$state.paused
+            dragging      = [bool]$state.dragging
+            hover         = [bool]$script:wanderHoverPause
+            waiting       = [bool]$state.waiting
+            approvalCount = @($state.approvalItems).Count
+            winLeft       = [double]$window.Left
+            winTop        = [double]$window.Top
+        }
+        if (-not $allowed) { return }
+
+        $wa = [System.Windows.SystemParameters]::WorkArea
+        $w = [double]$window.ActualWidth
+        $h = [double]$window.ActualHeight
+        if ($w -le 0 -or $h -le 0) { return }
+
+        $now = Get-Date
+        # 歇够了才挑新目标
+        if ($now -lt $state.wanderRestUntil) { return }
+
+        if ($null -eq $state.wanderTargetX -or $null -eq $state.wanderTargetY) {
+            $t = Get-WanderTarget $wa $w $h ([double]$window.Left) ([double]$window.Top) 140
+            $state.wanderTargetX = [double]$t.x
+            $state.wanderTargetY = [double]$t.y
+        }
+
+        $step = Get-WanderStep ([double]$window.Left) ([double]$window.Top) `
+                               ([double]$state.wanderTargetX) ([double]$state.wanderTargetY) $script:wanderSpeed
+        $point = Get-WanderClamped $wa $w $h ([double]$step.x) ([double]$step.y)
+        # 取整：素材形态下亚像素位移会让整张像素贴图每帧重采样（就是那个「频闪」），
+        # 所以走动也用整数坐标，画面是稳的。
+        $nx = [math]::Round([double]$point.x)
+        $ny = [math]::Round([double]$point.y)
+        if ([double]$window.Left -ne $nx) { $window.Left = $nx }
+        if ([double]$window.Top -ne $ny) { $window.Top = $ny }
+
+        if ($step.arrived) {
+            # 到点了：清目标 + 随机歇一会儿，避免像无头苍蝇一样一刻不停
+            $state.wanderTargetX = $null
+            $state.wanderTargetY = $null
+            $restMs = Get-Random -Minimum $script:wanderRestMinMs -Maximum ($script:wanderRestMaxMs + 1)
+            $state.wanderRestUntil = (Get-Date).AddMilliseconds($restMs)
+            $state.wanderLastDir = 'idle'
+        } elseif ($step.dir) {
+            # 记住这一帧的朝向：动画定时器据此播放 running-left / running-right
+            $state.wanderLastDir = [string]$step.dir
+        }
+    } catch {
+        Note-TickError 'wander' $_
+    }
+}
+
 # ---------------- 动画 ----------------
 $script:phase = 0.0
 $animTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -2401,6 +2536,18 @@ $animTimer.Add_Tick({
             $action = $state.action
         }
         if ($state.dragging) { $action = $state.dragDir }
+
+        # 随机移动：先挪窗口（内部会自己判断能不能动），再决定播哪个动作。
+        # 放在这里（而不是轮询定时器）是因为它要跟动画同步：40ms 一步走着才顺，
+        # 500ms 一步会变成一跳一跳的。
+        Update-Wander
+        if (-not $state.dragging -and -not ($state.reaction -and (Get-Date) -lt $state.reactionEnd)) {
+            $dir = [string]$state.wanderLastDir
+            if ([bool]$state.wanderEnabled -and ($dir -eq 'running-left' -or $dir -eq 'running-right')) {
+                # 正在走动 → 播朝那个方向跑的动作，让「在移动」一眼可见
+                $action = $dir
+            }
+        }
 
         # 暂停 = 只冻结小宠本身：不推进帧、不做浮动/缩放、不重画形象。
         # 下面的气泡/进度/等待提示一律照常刷新（这是暂停时唯一还在动的东西）。
@@ -2706,6 +2853,11 @@ $window.Add_Closed({
     try { if ($mutex) { $mutex.ReleaseMutex() } } catch { }
     Write-Log 'kun-pet-desktop stopped'
 })
+
+# 鼠标停在宠物上时暂停随机移动：用户想点它 / 想看清它在干嘛，这时候别自己跑掉。
+# 用 MouseEnter/Leave 维护一个标志，真正的判断在 Update-Wander 里。
+$window.Add_MouseEnter({ try { $script:wanderHoverPause = $true } catch { } })
+$window.Add_MouseLeave({ try { $script:wanderHoverPause = $false } catch { } })
 
 # 气泡文字长短会让窗口尺寸变化（SizeToContent 从左上角扩展），
 # 小宠会跟着上下跳、左右移。这里把「底边 + 水平中心」钉住：

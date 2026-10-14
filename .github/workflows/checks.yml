@@ -102,6 +102,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::pi integration 测试失败"; $fail = 1 }
           & ./desktop/tests/test-pi-multiwindow.ps1 -Windows 3
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::pi multiwindow 测试失败"; $fail = 1 }
+          & ./desktop/tests/test-wander.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::随机移动几何测试失败"; $fail = 1 }
+          & ./desktop/tests/test-wander-guards.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::随机移动护栏测试失败"; $fail = 1 }
           if ($fail -ne 0) { exit 1 }
 
       - name: 安装检查依赖
