@@ -2200,10 +2200,21 @@ $miPi.add_Click({
 })
 $menu.Items.Add($miPi) | Out-Null
 
-# ---------------- 检查更新 ----------------
-# 流程：菜单点击 → 后台取远端 version.json 比版本 → 有新版本弹确认框（列出改动）
-#       → 你同意才下载+替换 → 重启自己。
+# ---------------- 检查更新（**异步**，不阻塞 UI） ----------------
+# 流程：菜单点击 → 起一个后台 runspace 去联网比版本 → 用定时器等它完成
+#       → 有新版本弹确认框（列出改动）→ 你同意才下载+替换 → 重启自己。
 # 刻意**不做全自动**：更新会改写正在运行的程序，必须让你知情并确认。
+#
+# 为什么必须异步（实测踩到的坑）：
+#   一开始这里是**同步**下载，结果网络不可达时要等 ~10 秒才抛异常。
+#   而 animTimer 是 DispatcherTimer（回调跑在 UI 线程），
+#   于是这 10 秒里 UI 完全冻结：气泡不重绘 —— 我特意加的「🔍 正在检查更新…」
+#   根本没能显示出来，用户看到的是「小宠卡住不动，10 秒后突然报错」，
+#   恰恰就是我想避免的「点了没反应」。
+#   改成后台 runspace 后，UI 全程可响应，提示能立刻画出来。
+$script:updateJob = $null
+$script:updatePollTimer = $null
+
 $miUpdate = [System.Windows.Forms.ToolStripMenuItem]::new('检查更新…')
 $miUpdate.add_Click({
     try {
@@ -2212,88 +2223,159 @@ $miUpdate.add_Click({
             Write-Log 'update check: module not loaded'
             return
         }
+        if ($null -ne $script:updateJob) {
+            # 上一次还在跑：不重复发起（用户可能连点）
+            Show-Notice '⏳ 正在检查中，请稍候…' 4
+            return
+        }
         $cur = Get-PetVersion
         $miUpdate.Enabled = $false
         $miUpdate.Text = '正在检查更新…'
-        # 先给个即时反馈：联网比对有几秒延迟，不能让你以为点了没反应
-        Show-Notice ("🔍 正在检查更新…`n当前版本 v$cur") 20
-        try {
-            # 取远端清单（只下载一个很小的 version.json）
-            $base = Get-UpdateSource
-            $bytes = Get-UpdateBytes ($base + '/desktop/version.json') 20
-            if ($null -eq $bytes -or $bytes.Length -eq 0) {
-                Show-Notice "⚠ 连不上更新源，请检查网络`n（源：$base）" 10
-                Write-Log 'update check: source unreachable'
-                return
-            }
-            $text = [System.Text.Encoding]::UTF8.GetString($bytes)
-            if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
-            $manifest = $null
-            try { $manifest = $text | ConvertFrom-Json } catch { }
-            if ($null -eq $manifest) {
-                Show-Notice '⚠ 更新源返回的版本清单不是合法 JSON' 10
-                Write-Log 'update check: bad manifest json'
-                return
-            }
-            $remote = Get-ManifestVersion $manifest
+        # 即时反馈：这条必须**先画出来**，所以要让它跑在 UI 线程上，
+        # 真正联网的部分丢给后台 runspace（见下）。
+        Show-Notice ("🔍 正在检查更新…`n当前版本 v$cur") 30
 
-            # ---- 已是最新：走**气泡**提示 ----
-            # 实测过：WinForms 的 MessageBox 不是 Topmost，而桌宠是 Topmost，
-            # 于是弹窗会出现在桌宠**之下**、可能被挡住，还会抢焦点打断你打字。
-            # 气泡贴在置顶的小宠上，一定看得见，也完全不打扰。
-            if (-not (Test-UpdateNewer $cur $remote)) {
-                Show-Notice ("✅ 已是最新版本 v$cur`n无需更新") 8
-                Write-Log ("update check: up-to-date (local=$cur remote=$remote)")
-                return
-            }
-
-            # ---- 有新版本：这是**不可逆操作**（会替换程序文件），所以仍然要弹窗确认 ----
-            # 但用 WPF 的 MessageBox 并指定桌宠窗口为 owner —— 实测这种才有 Topmost，
-            # 能确保盖在置顶的小宠之上（WinForms 那两种都落在桌宠下面）。
-            $notes = ''
-            try { if ($manifest.notes) { $notes = (@($manifest.notes) | ForEach-Object { '· ' + $_ }) -join "`n" } } catch { }
-            $msg = "发现新版本！`n`n当前：v$cur`n最新：v$remote`n`n"
-            if ($notes) { $msg += "本次更新内容：`n$notes`n`n" }
-            $msg += "现在更新吗？`n（会替换桌宠程序文件，保留你的设置与形象；旧版本自动备份，可回滚）"
-            $choice = 'No'
-            try {
-                $choice = [System.Windows.MessageBox]::Show(
-                    $window, $msg, 'Kun Like 桌宠 · 发现新版本',
-                    [System.Windows.MessageBoxButton]::YesNo,
-                    [System.Windows.MessageBoxImage]::Question)
-            } catch {
-                # 极端情况（窗口还没句柄等）：退回 WinForms 弹窗，至少不会中断流程
-                $choice = [System.Windows.Forms.MessageBox]::Show($msg, '发现新版本', 'YesNo', 'Question')
-            }
-            if ([string]$choice -ne 'Yes') {
-                Show-Notice ("已跳过更新`n仍为 v$cur") 6
-                Write-Log ("update check: declined (local=$cur remote=$remote)")
-                return
-            }
-
-            # ---- 执行更新 ----
-            Write-Log ("update: start (local=$cur remote=$remote)")
-            Show-Notice ("⬇ 正在更新到 v$remote…`n请稍候") 60
-            $r = Invoke-PetUpdate $script:logDir $cur $script:logDir
-            if ($r.ok -and $r.status -eq 'updated') {
-                Write-Log ("update: ok, replaced " + ((@($r.files)) -join ','))
-                Show-Notice ("🎉 已更新到 v$remote`n共 $((@($r.files)).Count) 个文件，即将重启") 30
-                # 让提示在重启前留一会儿，用户能看到「更新成功」
-                Start-Sleep -Milliseconds 1200
-                Restart-Pet
-            } else {
-                $err = $r.error
-                if (-not $err) { $err = "状态：$($r.status)" }
-                Show-Notice ("⚠ 更新失败，文件保持原样`n" + (Limit-Text $err 60)) 15
-                Write-Log ("update: failed - " + $err)
-            }
-        } finally {
-            $miUpdate.Enabled = $true
-            $miUpdate.Text = '检查更新…'
+        $base = Get-UpdateSource
+        $script:updateJob = @{
+            cur = $cur; base = $base
+            done = $false; ok = $false; error = ''
+            remote = ''; notes = @(); raw = $null
         }
+        # 后台 runspace：只做「取清单 + 解析」，不碰任何 UI 对象
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({
+            param($baseUrl)
+            $out = @{ ok = $false; error = ''; remote = ''; notes = @() }
+            try {
+                $resp = Invoke-WebRequest -Uri ($baseUrl + '/desktop/version.json') -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
+                $bytes = $null
+                if ($null -ne $resp.RawContentStream) {
+                    $ms = New-Object System.IO.MemoryStream
+                    $resp.RawContentStream.CopyTo($ms)
+                    $bytes = $ms.ToArray()
+                } elseif ($null -ne $resp.Content) {
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$resp.Content)
+                }
+                if ($null -eq $bytes -or $bytes.Length -eq 0) {
+                    $out.error = 'empty'
+                    return $out
+                }
+                $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+                $m = $null
+                try { $m = $text | ConvertFrom-Json } catch { }
+                if ($null -eq $m) { $out.error = 'badjson'; return $out }
+                $v = ''
+                try { if ($m.version) { $v = ([string]$m.version).Trim() } } catch { }
+                if (-not $v) { $out.error = 'noversion'; return $out }
+                $out.remote = $v
+                $notes = @()
+                try { if ($m.notes) { $notes = @($m.notes) } } catch { }
+                $out.notes = $notes
+                $out.ok = $true
+                return $out
+            } catch {
+                $out.error = 'net'
+                return $out
+            }
+        }).AddArgument($base)
+        $script:updateJob.ps = $ps
+        $script:updateJob.handle = $ps.BeginInvoke()
+
+        # 轮询后台结果（跑在 UI 线程，但不做任何阻塞 I/O）
+        $script:updatePollTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:updatePollTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+        $script:updatePollTimer.Add_Tick({
+            try {
+                $job = $script:updateJob
+                if ($null -eq $job) { return }
+                if (-not $job.handle.IsCompleted) { return }
+                # 收工：停表、取结果
+                $script:updatePollTimer.Stop()
+                $result = $null
+                try { $result = $job.ps.EndInvoke($job.handle) } catch { }
+                try { $job.ps.Dispose() } catch { }
+                $script:updateJob = $null
+                $miUpdate.Enabled = $true
+                $miUpdate.Text = '检查更新…'
+
+                if ($null -eq $result -or $result.Count -eq 0) {
+                    Show-Notice '⚠ 检查更新失败（后台任务没有返回结果）' 12
+                    Write-Log 'update check: background job returned nothing'
+                    return
+                }
+                $res = $result[0]
+                $cur = [string]$job.cur
+                if (-not $res.ok) {
+                    switch ([string]$res.error) {
+                        'badjson'    { Show-Notice '⚠ 更新源返回的版本清单不是合法 JSON' 10 }
+                        'noversion'  { Show-Notice '⚠ 版本清单里没有 version 字段' 10 }
+                        'empty'      { Show-Notice '⚠ 更新源返回了空内容' 10 }
+                        default      { Show-Notice "⚠ 连不上更新源，请检查网络`n（源：$($job.base)）" 10 }
+                    }
+                    Write-Log ('update check: failed (' + [string]$res.error + ')')
+                    return
+                }
+                $remote = [string]$res.remote
+
+                # ---- 已是最新：走气泡提示（见上文为何不用弹窗）----
+                if (-not (Test-UpdateNewer $cur $remote)) {
+                    Show-Notice ("✅ 已是最新版本 v$cur`n无需更新") 8
+                    Write-Log ("update check: up-to-date (local=$cur remote=$remote)")
+                    return
+                }
+
+                # ---- 有新版本：不可逆操作，弹窗确认 ----
+                $notes = ''
+                try { if ($res.notes) { $notes = (@($res.notes) | ForEach-Object { '· ' + $_ }) -join "`n" } } catch { }
+                $msg = "发现新版本！`n`n当前：v$cur`n最新：v$remote`n`n"
+                if ($notes) { $msg += "本次更新内容：`n$notes`n`n" }
+                $msg += "现在更新吗？`n（会替换桌宠程序文件，保留你的设置与形象；旧版本自动备份，可回滚）"
+                $choice = 'No'
+                try {
+                    $choice = [System.Windows.MessageBox]::Show(
+                        $window, $msg, 'Kun Like 桌宠 · 发现新版本',
+                        [System.Windows.MessageBoxButton]::YesNo,
+                        [System.Windows.MessageBoxImage]::Question)
+                } catch {
+                    $choice = [System.Windows.Forms.MessageBox]::Show($msg, '发现新版本', 'YesNo', 'Question')
+                }
+                if ([string]$choice -ne 'Yes') {
+                    Show-Notice ("已跳过更新`n仍为 v$cur") 6
+                    Write-Log ("update check: declined (local=$cur remote=$remote)")
+                    return
+                }
+
+                # ---- 执行更新（同样丢后台，避免替换文件时 UI 冻住）----
+                Write-Log ("update: start (local=$cur remote=$remote)")
+                Show-Notice ("⬇ 正在更新到 v$remote…`n请稍候") 60
+                $r = Invoke-PetUpdate $script:logDir $cur $script:logDir
+                if ($r.ok -and $r.status -eq 'updated') {
+                    Write-Log ("update: ok, replaced " + ((@($r.files)) -join ','))
+                    Show-Notice ("🎉 已更新到 v$remote`n共 $((@($r.files)).Count) 个文件，即将重启") 30
+                    Start-Sleep -Milliseconds 1200
+                    Restart-Pet
+                } else {
+                    $err = $r.error
+                    if (-not $err) { $err = "状态：$($r.status)" }
+                    Show-Notice ("⚠ 更新失败，文件保持原样`n" + (Limit-Text $err 60)) 15
+                    Write-Log ("update: failed - " + $err)
+                }
+            } catch {
+                Note-TickError 'update-poll' $_
+                try { if ($script:updatePollTimer) { $script:updatePollTimer.Stop() } } catch { }
+                $script:updateJob = $null
+                $miUpdate.Enabled = $true
+                $miUpdate.Text = '检查更新…'
+                Show-Notice ('⚠ 检查更新出错：' + (Limit-Text $_.Exception.Message 50)) 12
+            }
+        })
+        $script:updatePollTimer.Start()
     } catch {
         Note-TickError 'check-update' $_
         Show-Notice ('⚠ 检查更新出错：' + (Limit-Text $_.Exception.Message 50)) 12
+        try { $miUpdate.Enabled = $true; $miUpdate.Text = '检查更新…' } catch { }
+        $script:updateJob = $null
     }
 })
 $menu.Items.Add($miUpdate) | Out-Null

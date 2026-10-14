@@ -70,5 +70,15 @@ CheckTrue '过期时间不是日期也不抛异常' $ok
 Check '无法判断过期时按「已过期」处理（宁可显示常态也不卡住）' $r.bubble 'x'
 
 Write-Host ""
+Write-Host "=== 5. 即时反馈必须立刻成为气泡内容 ===" -ForegroundColor Cyan
+# 守护一个真实 bug：检查更新最初是**同步**联网，而动画定时器跑在 UI 线程，
+# 于是网络不可达时 UI 冻结 ~10 秒、气泡不重绘 ——
+# 「🔍 正在检查更新…」一次都没显示出来（用户只看到小宠卡住然后报错）。
+# 修法是把联网丢到后台 runspace。这里验证提示置位后立刻就是气泡内容；
+# 真正的「UI 不阻塞」由运行时实测覆盖（见 docs/internals.md）。
+$r = Resolve-BubbleText '我先去干活啦！' '🔍 正在检查更新…' (Get-Date).AddSeconds(30) (Get-Date)
+Check '刚置位的提示立刻就是气泡内容' $r.bubble '🔍 正在检查更新…'
+
+Write-Host ""
 if ($script:fail -eq 0) { Write-Host ("全部通过：{0} 项" -f $script:pass) -ForegroundColor Green; exit 0 }
 else { Write-Host ("失败 {0} 项 / 通过 {1} 项" -f $script:fail, $script:pass) -ForegroundColor Red; exit 1 }
