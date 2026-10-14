@@ -106,7 +106,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::随机移动几何测试失败"; $fail = 1 }
           & ./desktop/tests/test-wander-guards.ps1
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::随机移动护栏测试失败"; $fail = 1 }
+          & ./desktop/tests/test-update.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::更新模块测试失败"; $fail = 1 }
+          & ./desktop/tests/test-update-flow.ps1 ./desktop
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::更新流程测试失败"; $fail = 1 }
           if ($fail -ne 0) { exit 1 }
+
+      - name: 版本号一致性（desktop/version.json 与脚本内兜底值）
+        shell: pwsh
+        run: |
+          # 脚本里有一份兜底版本号（读不到 version.json 时用），必须与 version.json 一致，
+          # 否则「检查更新」会误判（例如脚本写着 2.0.0、清单写着 2.1.0，
+          # 于是每次启动都提示有新版却永远装不上）。
+          $vj = (Get-Content ./desktop/version.json -Raw | ConvertFrom-Json).version
+          $m = Select-String -Path ./desktop/kun-pet-desktop.ps1 -Pattern "Version\s*=\s*'([^']+)'"
+          if (-not $m) { Write-Host "::error::脚本里找不到 Version 兜底值"; exit 1 }
+          $v2 = $m.Matches[0].Groups[1].Value
+          if ($vj -ne $v2) {
+            Write-Host ("::error::版本号不一致：version.json=$vj 脚本=$v2")
+            exit 1
+          }
+          Write-Host ("版本号一致：$vj")
 
       - name: 安装检查依赖
         run: python3 -m pip install --quiet --disable-pip-version-check Pillow

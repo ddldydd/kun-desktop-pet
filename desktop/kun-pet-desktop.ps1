@@ -61,6 +61,12 @@ $Config = @{
     DefaultCellW = 192
     DefaultCellH = 208
     Scale       = 0.62
+    # 当前版本（检查更新时与远端的 version.json 比较）。
+    # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
+    Version     = '2.1.0'
+    # 更新源与仓库（检查更新用）
+    UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
+    RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
     LogFile     = Join-Path $script:logDir 'kun-pet-desktop.log'
 }
 
@@ -943,6 +949,36 @@ try {
     }
 } catch {
     Write-Log ('wander module failed to load: ' + $_.Exception.Message)
+}
+
+# ---------------- 更新模块（检查更新 / 一键更新） ----------------
+# 同样单独成文件：版本比较、文件筛选、内容校验、原子替换与回滚都是可自测的逻辑。
+$script:updateModuleLoaded = $false
+try {
+    $script:updateModulePath = Join-Path $script:logDir 'kun-pet-update.ps1'
+    if (Test-Path -LiteralPath $script:updateModulePath) {
+        . $script:updateModulePath
+        $script:updateModuleLoaded = $true
+        Set-UpdateSource ([string]$Config.UpdateRawBase)
+    } else {
+        Write-Log ('update module not found; check-for-update disabled ({0})' -f $script:updateModulePath)
+    }
+} catch {
+    Write-Log ('update module failed to load: ' + $_.Exception.Message)
+}
+
+# 版本号以 version.json 为准（与更新源里那份同名文件同构），
+# 读不到就用 Config.Version 的兜底值 —— 这样「忘记同步版本号」不会让功能失效。
+$script:versionFile = Join-Path $script:logDir 'version.json'
+function Get-PetVersion {
+    try {
+        if (Test-Path -LiteralPath $script:versionFile) {
+            $m = Get-Content -LiteralPath $script:versionFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $v = Get-ManifestVersion $m
+            if ($v) { return $v }
+        }
+    } catch { }
+    return [string]$Config.Version
 }
 
 Function Get-StateFromHarness {
@@ -2112,6 +2148,127 @@ $miPi.add_Click({
 })
 $menu.Items.Add($miPi) | Out-Null
 
+# ---------------- 检查更新 ----------------
+# 流程：菜单点击 → 后台取远端 version.json 比版本 → 有新版本弹确认框（列出改动）
+#       → 你同意才下载+替换 → 重启自己。
+# 刻意**不做全自动**：更新会改写正在运行的程序，必须让你知情并确认。
+$miUpdate = [System.Windows.Forms.ToolStripMenuItem]::new('检查更新…')
+$miUpdate.add_Click({
+    try {
+        if (-not $script:updateModuleLoaded) {
+            [System.Windows.Forms.MessageBox]::Show(
+                '更新模块未加载（kun-pet-update.ps1 缺失），无法检查更新。',
+                'Kun Like 桌宠', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $cur = Get-PetVersion
+        $miUpdate.Enabled = $false
+        $miUpdate.Text = '正在检查更新…'
+        try {
+            # 取远端清单（只下载一个很小的 version.json）
+            $base = Get-UpdateSource
+            $bytes = Get-UpdateBytes ($base + '/desktop/version.json') 20
+            if ($null -eq $bytes -or $bytes.Length -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "无法连接更新源，请检查网络。`n`n源：$base",
+                    '检查更新失败', 'OK', 'Warning') | Out-Null
+                return
+            }
+            $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+            if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+            $manifest = $null
+            try { $manifest = $text | ConvertFrom-Json } catch { }
+            if ($null -eq $manifest) {
+                [System.Windows.Forms.MessageBox]::Show('更新源返回的版本清单不是合法 JSON。', '检查更新失败', 'OK', 'Warning') | Out-Null
+                return
+            }
+            $remote = Get-ManifestVersion $manifest
+            if (-not (Test-UpdateNewer $cur $remote)) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "已是最新版本。`n`n当前版本：$cur",
+                    'Kun Like 桌宠', 'OK', 'Information') | Out-Null
+                Write-Log ("update check: up-to-date (local=$cur remote=$remote)")
+                return
+            }
+
+            # 有新版本 → 让用户确认
+            $notes = ''
+            try { if ($manifest.notes) { $notes = (@($manifest.notes) | ForEach-Object { '· ' + $_ }) -join "`n" } } catch { }
+            $msg = "发现新版本！`n`n当前：$cur`n最新：$remote`n`n"
+            if ($notes) { $msg += "本次更新内容：`n$notes`n`n" }
+            $msg += "现在更新吗？`n（更新会替换桌宠程序文件，并保留你的设置与形象；`n  旧版本会自动备份，可回滚）"
+            $choice = [System.Windows.Forms.MessageBox]::Show($msg, '发现新版本', 'YesNo', 'Question')
+            if ($choice -ne 'Yes') {
+                Write-Log ("update check: declined (local=$cur remote=$remote)")
+                return
+            }
+
+            # 执行更新
+            Write-Log ("update: start (local=$cur remote=$remote)")
+            $r = Invoke-PetUpdate $script:logDir $cur $script:logDir
+            if ($r.ok -and $r.status -eq 'updated') {
+                $body = "已更新到 $remote ✓`n`n更动文件 $((@($r.files)).Count) 个。`n现在重启桌宠以应用更新。"
+                if ($r.backupDir) { $body += "`n`n旧版本备份在：`n$($r.backupDir)" }
+                [System.Windows.Forms.MessageBox]::Show($body, '更新成功', 'OK', 'Information') | Out-Null
+                Write-Log ("update: ok, replaced " + ((@($r.files)) -join ','))
+                Restart-Pet
+            } else {
+                $err = $r.error
+                if (-not $err) { $err = "状态：$($r.status)" }
+                [System.Windows.Forms.MessageBox]::Show(
+                    "更新未完成，磁盘内容保持原样：`n`n$err",
+                    '更新失败', 'OK', 'Warning') | Out-Null
+                Write-Log ("update: failed - " + $err)
+            }
+        } finally {
+            $miUpdate.Enabled = $true
+            $miUpdate.Text = '检查更新…'
+        }
+    } catch {
+        Note-TickError 'check-update' $_
+        try {
+            [System.Windows.Forms.MessageBox]::Show(("检查更新出错：`n" + $_.Exception.Message), 'Kun Like 桌宠', 'OK', 'Warning') | Out-Null
+        } catch { }
+    }
+})
+$menu.Items.Add($miUpdate) | Out-Null
+
+# ---------------- 重启桌宠（更新后应用新版本） ----------------
+# 正在运行的进程已经把**旧代码**读进内存了，替换磁盘文件不会改变当前行为，
+# 所以更新完必须重启。
+#
+# 做法：起一个新的 powershell 进程加载**磁盘上的新脚本**，然后退出自己。
+# 不能直接调用启动器 VBS 依赖它去找路径吗？可以，但这里更直接：
+# 新进程用与 VBS 相同的「显式 UTF-8 读取 + ScriptBlock」方式启动，
+# 保证中文不乱码（这是本仓库踩过的坑）。
+#
+# 注意：先启动新进程再退出自己 —— 单实例互斥体在旧进程退出后才释放，
+# 所以新进程启动后要等一会儿才拿到互斥体。为此新进程延迟 2 秒再抢。
+function Restart-Pet {
+    try {
+        $scriptPath = Join-Path $script:logDir 'kun-pet-desktop.ps1'
+        if (-not (Test-Path -LiteralPath $scriptPath)) {
+            Write-Log 'restart skipped: script not found'
+            return
+        }
+        $base = $script:logDir
+        # 新进程：睡 2 秒（等旧进程释放互斥体）→ 再加载新脚本
+        $inner = "Start-Sleep -Seconds 2; " +
+                 "Set-Location -LiteralPath '$base'; " +
+                 "`$cwd='$base'; " +
+                 "`$c=[IO.File]::ReadAllText('$scriptPath',[Text.Encoding]::UTF8); " +
+                 "& ([ScriptBlock]::Create(`$c))"
+        Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', $inner `
+            -WorkingDirectory $base | Out-Null
+        Write-Log 'restart: launched new instance'
+        # 退出自己（Closed 处理器会保存设置、释放互斥体）
+        try { $window.Close() } catch { }
+    } catch {
+        Note-TickError 'restart' $_
+    }
+}
+
 $miThrough = [System.Windows.Forms.ToolStripMenuItem]::new('鼠标穿透')
 $miThrough.Enabled = $script:clickThroughAvailable
 $miThrough.add_Click({
@@ -2259,6 +2416,8 @@ Write-Log ('pi compatibility: ' + $(if ($state.piEnabled) { 'enabled' } else { '
 # 随机移动开关的勾选同样要跟着设置走
 $miWander.Checked = [bool]$state.wanderEnabled
 Write-Log ('wander: ' + $(if ($state.wanderEnabled) { 'enabled' } else { 'disabled' }) + $(if (-not $script:wanderModuleLoaded) { ' (module missing!)' } else { '' }))
+# 版本与更新模块状态：排查「检查更新点了没反应」时先看这两行
+Write-Log ('version: ' + (Get-PetVersion) + ' · update module: ' + $(if ($script:updateModuleLoaded) { 'loaded' } else { 'MISSING' }) + ' · source: ' + (Get-UpdateSource))
 # 启动时若处于暂停：先按当前状态画一帧，避免气泡停在上一个会话的旧文字或 "..."
 if ($state.paused) { Render-PausedFrame }
 
@@ -2728,8 +2887,10 @@ $animTimer.Add_Tick({
         }
         $pauseLabel = ''
         if ($state.paused) { $pauseLabel = ' · 已暂停' }
-        # 进展显示在气泡里；底部只保留来源/模型/时长等辅助信息（仅变化时写，减少布局）
-        $hintValue = '{0}{1}{2} · 已 {3}s' -f $sourceLabel, $piLabel, $pauseLabel, $elapsedSec
+        # 版本号放在底部：用户能一眼看到自己跑的是哪一版（排查/确认更新是否生效都靠它）
+        $verLabel = ' · v' + (Get-PetVersion)
+        # 进展显示在气泡里；底部只保留来源/版本/模型/时长等辅助信息（仅变化时写，减少布局）
+        $hintValue = '{0}{1}{2}{3} · 已 {4}s' -f $sourceLabel, $verLabel, $piLabel, $pauseLabel, $elapsedSec
         if ($hintTextEl.Text -ne $hintValue) { $hintTextEl.Text = $hintValue }
     } catch { Note-TickError 'anim' $_ }
 })

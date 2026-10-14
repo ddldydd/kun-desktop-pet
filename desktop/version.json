@@ -1,0 +1,21 @@
+{
+  "version": "2.1.0",
+  "releasedAt": "2026-10-14",
+  "notes": [
+    "新增「到处跑（随机移动）」：宠物可自己在桌面上溜达，菜单里可随时开关",
+    "新增「检查更新」：有新版本时可一键更新并自动重启",
+    "跟随 pi coding agent：只读会话文件 + 扩展推送（含「pi 正在等你」）",
+    "修复：同一目录多开 pi 只显示一个任务（改为按目录层级排除子代理）",
+    "修复：含中文的 .ps1 缺 UTF-8 BOM 导致 Windows PowerShell 5.1 解析失败"
+  ],
+  "files": [
+    "kun-pet-desktop.ps1",
+    "kun-pet-pi-source.ps1",
+    "kun-pet-wander.ps1",
+    "kun-pet-update.ps1",
+    "启动桌宠.vbs",
+    "start-pet.vbs",
+    "启动桌宠.bat",
+    "version.json"
+  ]
+}
