@@ -127,10 +127,66 @@ jobs:
           # 纯 ASCII 的脚本不需要 BOM；反过来，带 BOM 的也没问题。
           if ($fail -ne 0) { exit 1 }
 
+      - name: 网页内宠物必须保持移除（Host 半区保留）
+        shell: pwsh
+        run: |
+          # 需求：只保留桌面宠物，不要「Harness 网页里那只宠物」。
+          # 关键在于：桌面宠物读的是 Host 半区（/kun-pet/state + /kun-pet/approval），
+          # 与网页渲染无关 —— 所以移除 Client 半区不该影响桌面宠物。
+          # 这几条断言防止它被无意中加回来，或防止 Host 半区被误删
+          # （那才会真的让桌面宠物失去审批功能）。
+          $fail = 0
+          if (Test-Path ./plugin/client.js) {
+            Write-Host "::error::plugin/client.js 又出现了 —— 网页内宠物应保持移除"
+            $fail = 1
+          }
+          if (-not (Test-Path ./plugin/index.js)) {
+            Write-Host "::error::缺少 plugin/index.js —— 桌面宠物会失去审批/进展数据"
+            $fail = 1
+          }
+          $pkgText = Get-Content ./plugin/package.json -Raw
+          $pkg = $null
+          try { $pkg = $pkgText | ConvertFrom-Json } catch { }
+          if ($null -eq $pkg) {
+            Write-Host "::error::plugin/package.json 不是合法 JSON"
+            $fail = 1
+          } else {
+            # 注意：要按 JSON **结构**判断，不能找字面量 "dsh.bundle" ——
+            # 文件里是嵌套的 { "dsh": { "bundle": ... } }，没有这个字面量
+            # （我第一版就是这么写错的，结果永远误报「缺 dsh.bundle」）。
+            if ($null -ne $pkg.dsh.client) {
+              Write-Host "::error::package.json 仍在声明 dsh.client（网页内宠物）"
+              $fail = 1
+            }
+            if ($null -eq $pkg.dsh.bundle) {
+              Write-Host "::error::package.json 缺少 dsh.bundle —— Host 半区可能不会被加载"
+              $fail = 1
+            }
+            if ($pkg.exports.PSObject.Properties.Name -contains './client') {
+              Write-Host "::error::package.json 仍导出 ./client（网页内宠物）"
+              $fail = 1
+            }
+          }
+          # 端点契约：桌面宠物依赖这三个，Host 半区必须继续提供
+          $idxText = Get-Content ./plugin/index.js -Raw
+          foreach ($ep in @('/kun-pet/state', '/kun-pet/approval', '/kun-pet/skin.png')) {
+            if ($idxText -notmatch [regex]::Escape($ep)) {
+              Write-Host ("::error::index.js 里找不到端点 " + $ep + " —— 桌面宠物功能会缺失")
+              $fail = 1
+            }
+          }
+          if ($fail -ne 0) { exit 1 }
+          Write-Host "网页内宠物已移除；Host 半区与三个端点齐备"
+
       - name: Node 语法检查
         run: |
+          # plugin/client.js（Harness 网页内的宠物渲染）已从仓库移除，
+          # 只剩 Host 半区 index.js。别再把已删文件写进检查，否则 CI 必挂。
           node --check plugin/index.js
-          node --check plugin/client.js
+          if [ -f plugin/client.js ]; then
+            echo "::error::plugin/client.js 不应存在（网页内宠物已移除）"
+            exit 1
+          fi
 
       - name: pi 源适配器自测（夹具 + 接入层）
         shell: pwsh

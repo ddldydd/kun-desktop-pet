@@ -1,26 +1,20 @@
 {
   "name": "@local/kun-pet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Kun Like 桌宠（静态移植版）：Web 界面右下角小宠，随 Agent 工作状态切换动作与气泡文案，任务完成播放提示音",
+  "description": "Kun Like 桌宠 · DSH Host 半区：提供 /kun-pet/state 与 /kun-pet/approval，供 Windows 桌面宠物读取任务进展并在桌宠上直接同意/拒绝",
   "type": "module",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web",
-      "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
     }
   },
   "meta": {
-    "title": "Kun Like 桌宠",
-    "description": "右下角桌面宠物：随 Agent 工作状态显示动画与气泡，任务完成/出错即时提示"
+    "title": "Kun Like 桌宠（桌面宠物数据通道）",
+    "description": "为 Windows 桌面宠物提供任务进展与审批数据；不含 Harness 网页内的宠物"
   }
 }

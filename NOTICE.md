@@ -52,9 +52,9 @@
 - `desktop/kun-pet-desktop.ps1` —— 桌面桌宠本体（WPF 渲染、状态机、素材加载、气泡、托盘、审批面板等）
 - `desktop/kun-pet-pi-source.ps1` —— pi coding agent 源适配器（只读尾随 + 扩展快照 + 多源仲裁）
 - `desktop/tests/` —— pi 源适配器的夹具与自测脚本
-- `plugin/index.js`、`plugin/client.js` —— DSH 插件（host 状态机 / 端点 / 审批应答；网页端小宠渲染）
+- `plugin/index.js` —— DSH 插件 Host 半区（状态机 / 端点 / 审批应答）；网页端小宠渲染已移除
 - `pi-extension/kun-pet.ts` —— pi 扩展（状态快照发布）
-- `install.ps1`、`uninstall.ps1`、`plugin/toggle-gui-pet.ps1` 等脚本
+- `install.ps1`、`uninstall.ps1` 等脚本
 - `docs/` 下的文档
 
 以上均为 MIT 许可。

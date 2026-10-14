@@ -21,4 +21,3 @@
 # 让 GitHub 语言统计更真实（否则会被大体积素材 / 内嵌 base64 带偏）
 *.png   linguist-vendored
 *.webp  linguist-vendored
-plugin/client.js linguist-generated

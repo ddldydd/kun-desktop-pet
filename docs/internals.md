@@ -14,7 +14,6 @@ desktop/kun-pet-update.ps1      更新的纯函数（版本比较 / 清单筛选
 desktop/version.json            版本号、发版说明、可更新文件清单（更新源里的同名文件）
 desktop/tests/                  pi 源适配器 + 随机移动 + 更新的自测（不需要真的起桌宠）
 plugin/index.js                 DSH 插件 host 半区：状态机、HTTP/文件双通道、审批应答
-plugin/client.js                DSH 插件 client 半区：DSH 网页右下角那只小宠
 pi-extension/kun-pet.ts         pi 扩展：把 pi 状态写成 JSON 快照（含「正在等你」）
 tools/add-bom.ps1               给含中文的 .ps1 补 UTF-8 BOM（见下文「编码」一节）
 install.ps1 / uninstall.ps1     安装 / 卸载
@@ -174,7 +173,51 @@ Windows PowerShell 5.1 对**没有 BOM** 的 `.ps1` 按系统 ANSI 代码页（�
 
 ---
 
-## 3. 更新模块
+## 3. 网页内宠物已移除（Host / Client 半区之分）
+
+DSH 插件 `@local/kun-pet` 原本有**两个半区**：
+
+| 半区 | 文件 | 作用 | 谁需要 |
+|---|---|---|---|
+| **Host** | `plugin/index.js` | 状态机 + `/kun-pet/state` + `/kun-pet/approval` + `/kun-pet/skin.png` | **桌面宠物**（进展气泡、桌宠上的 ✓/✗ 按钮） |
+| **Client** | `plugin/client.js` | 在 Harness 网页右下角渲染一只小宠（内嵌 SVG + 动画） | 只有网页宠物自己 |
+
+需求是「只保留桌面宠物」，所以 **Client 半区已整体移除**：删掉 `plugin/client.js`，
+并从 `plugin/package.json` 去掉 `exports["./client"]` 与 `dsh.client` 声明。
+
+**为什么这与「桌面宠物功能不变」不冲突**：桌面宠物读的是 **Host 半区**的 HTTP 端点，
+与网页里的渲染毫无关系。移除后实测确认：
+
+```
+/kun-pet/state    → 仍返回全部 34 个字段（mode / waiting / pendingApprovals …）
+/kun-pet/approval → 路由仍在（桌宠上的 ✓同意 / ✗拒绝）
+/kun-pet/skin.png → HTTP 200（桌宠形象）
+/kun-pet/client.js→ HTTP 404（网页宠物代码确实没了）
+```
+
+并且桌宠日志里 `plugin channel: http` 正常，还实测触发过
+`alert: 需要你回答：Agent 正在向你提问` —— 说明**审批/提问功能完好**。
+
+几个容易踩到的点：
+
+- **`install.ps1` 早先会拷 `client.js`**。若只删仓库里的文件而不改安装脚本，
+  任何一次 `install.ps1 -InstallPlugin` 都会把网页宠物**装回来**。现在安装脚本
+  只装 Host 半区，并且会**主动清掉历史遗留的 `client.js`**（老版本装过它）。
+- **`package.json` 少了 `dsh.client` 是否会被 DSH 拒绝**：DSH 是**启动时**读清单并注入
+  client bundle 的，所以这一点只能在下一次启动 DSH 时验证。改动保留了 `dsh.bundle`
+  （Host 半区加载所需的 patch 声明），属于最小改动；异常时可从
+  `webpet-rollback/`（仓库外，不进 git）恢复。
+- **别把已删文件留在 CI 里**。原先 CI 有 `node --check plugin/client.js`，
+  文件删掉后这一步必然失败 —— 已改成检查 `index.js`，并**断言 `client.js` 不存在**
+  （防止它被误加回来）。
+- **`.gitattributes` 里的 `plugin/client.js linguist-generated`** 也要一起删，
+  否则指向一个不存在的文件。
+- **回滚路径**：`git show <删除该文件的提交>^:plugin/client.js` 可把渲染代码取回，
+  再配合旧版 `package.json`（含 `dsh.client`）即可恢复网页宠物。
+
+---
+
+## 4. 更新模块
 
 已安装的桌宠可以一键更新。更新源是 **GitHub raw 逐文件**：
 
@@ -270,7 +313,7 @@ UI 全程可响应，提示立刻可见。**凡是联网/耗时的操作都不�
 
 ---
 
-## 4. 随机移动（到处跑）
+## 5. 随机移动（到处跑）
 
 小宠自己在桌面上溜达：随机挑目标 → 匀速走过去 → 到点随机歇 1~5 秒 → 再挑下一个。
 默认**关**（宠物自己会动是有打扰性的，必须用户主动开）。
@@ -307,7 +350,7 @@ UI 全程可响应，提示立刻可见。**凡是联网/耗时的操作都不�
 
 ---
 
-## 5. 频闪是怎么修的（v2 的两个根因）
+## 6. 频闪是怎么修的（v2 的两个根因）
 
 现象：小宠每隔约 1 秒「消失一瞬」再出现。
 
@@ -343,7 +386,7 @@ petdex / Codex 的精灵图统一是 8 列，但每个动作真正有内容的�
 
 ---
 
-## 6. 暂停的语义
+## 7. 暂停的语义
 
 菜单里的「暂停」**只冻结小宠本身**：不推进动画帧、不浮动 / 缩放、点击不再挥手出声。
 **任务气泡、进度、底部提示、提醒全部照常更新**——暂停动画也不会漏掉任务进展。
@@ -353,7 +396,7 @@ petdex / Codex 的精灵图统一是 8 列，但每个动作真正有内容的�
 
 ---
 
-## 7. 审批通道（插件的核心）
+## 8. 审批通道（插件的核心）
 
 ### 两条通道
 
@@ -393,7 +436,7 @@ petdex / Codex 的精灵图统一是 8 列，但每个动作真正有内容的�
 
 ---
 
-## 8. 位置与配置的持久化
+## 9. 位置与配置的持久化
 
 `kun-pet-settings.json` 与日志**固定在脚本所在目录**，而不是当前工作目录。
 原因：`ScriptBlock::Create` 执行脚本时 `$PSScriptRoot` 为空，所以三个启动器都显式把
@@ -413,7 +456,7 @@ petdex / Codex 的精灵图统一是 8 列，但每个动作真正有内容的�
 
 ---
 
-## 9. 素材格式
+## 10. 素材格式
 
 ```
 ~/.petdex/pets/<slug>/pet.json

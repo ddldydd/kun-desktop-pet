@@ -37,7 +37,7 @@
 | 目录 | 内容 | 需要 DSH 吗 |
 |---|---|---|
 | `desktop/` | **桌面桌宠本体**：悬浮在 Windows 桌面上的那只宠物 | 不需要 |
-| `plugin/` | **DSH 插件 `@local/kun-pet`**：给桌面桌宠提供「审批 / 提问」数据通道，并能在 Harness 网页里再显示一只小宠 | 需要 |
+| `plugin/` | **DSH 插件 `@local/kun-pet`（Host 半区）**：给桌面桌宠提供「审批 / 提问」数据通道（`/kun-pet/state` 与 `/kun-pet/approval`）。**不含 Harness 网页内的宠物** | 需要 |
 | `pi-extension/` | **pi coding agent 扩展**：把 pi 的运行时状态（尤其是「正在等你确认」）发布给桌宠 | 需要 pi |
 | `assets/pets/` | 两只随仓库附带的桌宠形象（`ikkun`、`haiyue-classic`），可直接用 | 不需要 |
 
@@ -297,15 +297,23 @@ Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | Select-Object mode, upd
 
 看到 JSON（而不是 404）就对了。插件自己的日志在 `~/.dsh/kun-pet-host.log`。
 
-**网页里的那只小宠**：`plugin/client.js` 里带了「Harness 网页右下角小宠」的实现，本仓库默认**开启**（这样你可以在网页里也养一只）。不想要就用：
+**Harness 网页里的宠物已移除。** 本仓库的 `plugin/` 只保留 **Host 半区**
+（状态机 + `/kun-pet/state` + `/kun-pet/approval`），也就是桌面宠物需要的部分；
+原先「Harness 网页右下角也养一只」的渲染代码（`client.js`）已从仓库删除，
+`package.json` 里对应的 `dsh.client` 声明也一并去掉。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\plugin\toggle-gui-pet.ps1 status
-powershell -NoProfile -ExecutionPolicy Bypass -File .\plugin\toggle-gui-pet.ps1 disable   # 关掉网页那只（host 半区不受影响）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\plugin\toggle-gui-pet.ps1 restore   # 恢复
-```
+这件事**不影响桌面宠物的任何功能** —— 桌面宠物读的是 Host 半区的端点，
+与网页里的渲染无关。移除后已实测确认：`/kun-pet/state` 仍返回全部字段、
+`/kun-pet/approval`（桌宠上的 ✓/✗ 按钮）与 `/kun-pet/skin.png` 均正常。
 
-改完刷新 Harness 页面（F5）生效。
+> 升级说明：如果你以前装过带网页宠物的旧版本，重跑 `install.ps1 -InstallPlugin`
+> 会自动清掉残留的 `client.js`；也可以手动删
+> `~/.dsh/profiles/<profile>/node_modules/@local/kun-pet/client.js`。
+> 删完刷新一次 Harness 页面（F5）即可。
+>
+> 想恢复网页宠物：从 git 历史里取回 `plugin/client.js` 与旧版 `package.json`
+> （`git log --diff-filter=D -- plugin/client.js` 找到删除它的提交，再
+> `git show <sha>^:plugin/client.js > plugin/client.js`）。
 
 ---
 

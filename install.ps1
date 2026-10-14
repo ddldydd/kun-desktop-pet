@@ -175,10 +175,27 @@ if (-not $InstallPlugin) {
     } else {
         $dest = Join-Path $profileDir 'node_modules\@local\kun-pet'
         New-Item -ItemType Directory -Force -Path $dest | Out-Null
-        foreach ($f in @('index.js', 'client.js', 'package.json')) {
-            Copy-Item -LiteralPath (Join-Path $srcPlugin $f) -Destination (Join-Path $dest $f) -Force
+        # 只装 Host 半区（index.js + package.json）。
+        # **刻意不装 client.js**：那是「Harness 网页里那只宠物」的渲染代码。
+        # 桌面宠物需要的是 Host 半区提供的 /kun-pet/state 与 /kun-pet/approval，
+        # 与网页宠物无关 —— 所以不装它，桌面宠物功能一个都不少。
+        # 想恢复网页宠物见 README（从 git 历史取回 client.js 与旧 package.json）。
+        $hostHalf = @('index.js', 'package.json')
+        foreach ($f in $hostHalf) {
+            $src = Join-Path $srcPlugin $f
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $dest $f) -Force
+            }
         }
-        Ok ("插件文件已装: " + $dest)
+        Ok ("插件文件已装（Host 半区，不含网页宠物）: " + $dest)
+
+        # 清掉历史安装遗留的 client.js：早期版本装过它，残留会让网页宠物继续出现
+        # （DSH 按 package.json 的 dsh.client 声明去找，但文件在就会被注入）。
+        $stale = Join-Path $dest 'client.js'
+        if (Test-Path -LiteralPath $stale) {
+            Remove-Item -LiteralPath $stale -Force
+            Ok '已清掉历史遗留的网页宠物渲染文件（client.js）'
+        }
 
         # 把 insert 追加到 profile 的 cordis.patch.yml（已存在则不动）
         $patch = Join-Path $profileDir 'cordis.patch.yml'
