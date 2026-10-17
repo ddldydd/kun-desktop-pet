@@ -42,6 +42,9 @@ param(
     # 装完立刻启动桌宠
     [switch]$Start,
 
+    # 不在桌面创建「启动桌宠」快捷方式（默认会创建；加此开关显式跳过）
+    [switch]$NoShortcut,
+
     # 「推荐默认值」：给双击入口（根目录的 安装.cmd）用。
     # 一次性打开：装素材 + 装插件/扩展（存在才装）+ 装完启动。
     #
@@ -287,6 +290,37 @@ if (-not $Autostart) {
     Info '（登录后自动出现；删掉 KunPet-autostart.cmd 即可关闭自启）'
 }
 
+# ---------------- 4.5 桌面快捷方式 ----------------
+Write-Host ""
+Write-Host "4.5) 桌面快捷方式" -ForegroundColor Cyan
+
+if ($NoShortcut) {
+    Info '已按 -NoShortcut 跳过（桌面上不会有「启动桌宠」快捷方式）'
+} else {
+    try {
+        # 桌面路径必须走系统 API：OneDrive 重定向等情况下 %USERPROFILE%\Desktop 会指错地方。
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if (-not $desktop -or -not (Test-Path -LiteralPath $desktop)) {
+            Warn '取不到桌面目录，跳过创建快捷方式。'
+        } else {
+            $shortcutPath = Join-Path $desktop '启动桌宠.lnk'
+            $wsh = New-Object -ComObject WScript.Shell
+            $lnk = $wsh.CreateShortcut($shortcutPath)
+            # 快捷方式指向 wscript.exe，参数是被引号包起来的启动器 .vbs，
+            # 工作目录设为安装目录（与手动双击启动器时一致，读同一份配置）。
+            $lnk.TargetPath = 'wscript.exe'
+            $lnk.Arguments = '"' + $petVbs + '"'
+            $lnk.WorkingDirectory = $targetFull
+            $lnk.Description = '启动 Kun Like 桌宠'
+            $lnk.Save()
+            Ok ('已创建桌面快捷方式: ' + $shortcutPath)
+        }
+    } catch {
+        # 快捷方式属于锦上添花：失败绝不能阻断安装，桌宠本体已经装好了。
+        Warn ('创建桌面快捷方式失败，已跳过: ' + $_.Exception.Message)
+    }
+}
+
 # ---------------- 5. 启动 ----------------
 Write-Host ""
 if ($Start) {
@@ -303,6 +337,12 @@ if ($Start) {
 
 Write-Host "安装完成 ✓" -ForegroundColor Green
 Write-Host ""
+if (-not $NoShortcut) {
+    try {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if ($desktop) { Write-Host ('  桌面快捷方式 : ' + (Join-Path $desktop '启动桌宠.lnk')) -ForegroundColor Gray }
+    } catch { }
+}
 Write-Host ("  启动方式 : 双击 " + $petVbs) -ForegroundColor Gray
 Write-Host ("  配置文件 : " + (Join-Path $targetFull 'kun-pet-settings.json')) -ForegroundColor Gray
 Write-Host ("  日志     : " + (Join-Path $targetFull 'kun-pet-desktop.log')) -ForegroundColor Gray

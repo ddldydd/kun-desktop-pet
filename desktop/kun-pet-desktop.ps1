@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.2.0'
+    Version     = '2.2.1'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -959,6 +959,23 @@ try {
     Write-Log ('wander module failed to load: ' + $_.Exception.Message)
 }
 
+# wander 模块缺失时（Test-Path 失败 / dot-source 抛错），Convert-PxToDip 与
+# Get-ClampedPos 也随之缺失。但拖拽 MouseMove 直接调用它们，函数不存在会抛
+# CommandNotFound、被外层 catch 吞掉（Note-TickError 'drag-move'）→ 拖拽从
+# 「高 DPI 不准」退化成「完全拖不动」，比修复前更糟。
+# 所以这里补 fallback：退化为 2.2.0 旧行为（1:1、不夹紧）——与「随机移动被
+# 禁用」的降级语义一致，可接受且最稳。位置恢复/SizeChanged 各自有 catch 兜底。
+# 注意只在未加载成功时定义，否则会覆盖 wander 模块里的正版实现。
+if (-not $script:wanderModuleLoaded) {
+    function Convert-PxToDip([double]$px, [double]$scale) {
+        if ($scale -le 0) { return $px }
+        return $px   # fallback：不换算（= 旧行为，仅 100% 缩放正确）
+    }
+    function Get-ClampedPos($bounds, [double]$winW, [double]$winH, [double]$x, [double]$y, [double]$keepPx = 0.0) {
+        return @{ x = $x; y = $y }   # fallback：不夹紧（= 旧行为）
+    }
+}
+
 # ---------------- 纯 UI 辅助（可自测） ----------------
 # 只放不碰 WPF 对象的纯函数，例如「气泡该显示什么」（含临时提示的优先级与过期）。
 # 放模块里是为了能被测试**直接调用产品代码**，而不是在测试里复制一份逻辑
@@ -1607,6 +1624,19 @@ function Save-Settings {
     }
 }
 
+# 虚拟屏幕 bounds（多屏并集）。Left/Top 允许为负 —— 副屏在主屏左侧/上方时就是这样表示的。
+# 位置恢复 / 拖拽夹紧 / wander 都必须用它而不是 PrimaryScreen*（后者只描述主屏）。
+function Get-VirtualScreenBounds {
+    $l = [double][System.Windows.SystemParameters]::VirtualScreenLeft
+    $t = [double][System.Windows.SystemParameters]::VirtualScreenTop
+    return @{
+        Left   = $l
+        Top    = $t
+        Right  = $l + [double][System.Windows.SystemParameters]::VirtualScreenWidth
+        Bottom = $t + [double][System.Windows.SystemParameters]::VirtualScreenHeight
+    }
+}
+
 function Load-Settings {
     try {
         if (-not (Test-Path $script:settingsFile)) { return }
@@ -1654,14 +1684,28 @@ function Load-Settings {
         if ($null -ne $saved.wander) {
             $state.wanderEnabled = [bool]$saved.wander
         }
-        if ($saved.posLeft -and $saved.posTop) {
-            $screenW = [System.Windows.SystemParameters]::PrimaryScreenWidth
-            $screenH = [System.Windows.SystemParameters]::PrimaryScreenHeight
-            if ($saved.posLeft -gt -200 -and $saved.posLeft -lt $screenW -and
-                $saved.posTop -gt -200 -and $saved.posTop -lt $screenH) {
+        # 旧逻辑只看主屏（PrimaryScreen*）且要求 posLeft > -200：
+        # 副屏在主屏左侧时 Left 为负（如 -1920）会被误判非法，多屏用户每次启动丢位置；
+        # 换分辨率后也可能落屏外。改成按虚拟屏幕 + 窗口尺寸夹紧，允许负坐标。
+        if ($null -ne $saved.posLeft -and $null -ne $saved.posTop) {
+            try {
+                $vs = Get-VirtualScreenBounds
+                # 旧设置文件可能没有 posW/posH：夹紧时按「至少 120px 可见」的保守尺寸估算，
+                # 保证窗口能找回来；有尺寸则按完整窗口夹紧。
+                $cw = 120.0
+                $ch = 120.0
+                if ($null -ne $saved.posW -and [double]$saved.posW -gt 0) { $cw = [double]$saved.posW }
+                if ($null -ne $saved.posH -and [double]$saved.posH -gt 0) { $ch = [double]$saved.posH }
+                $c = Get-ClampedPos $vs $cw $ch ([double]$saved.posLeft) ([double]$saved.posTop) 0.0
+                $window.Left = $c.x
+                $window.Top = $c.y
+                # 记下保存时的窗口尺寸：首次布局后按底边/中心校正（见 SizeChanged）
+                if ($null -ne $saved.posW) { $script:pendingPosW = [double]$saved.posW }
+                if ($null -ne $saved.posH) { $script:pendingPosH = [double]$saved.posH }
+            } catch {
+                # 夹紧失败（如 wander 模块缺失）也不至于丢掉位置：退化为原样设置
                 $window.Left = [double]$saved.posLeft
                 $window.Top = [double]$saved.posTop
-                # 记下保存时的窗口尺寸：首次布局后按底边/中心校正（见 SizeChanged）
                 if ($null -ne $saved.posW) { $script:pendingPosW = [double]$saved.posW }
                 if ($null -ne $saved.posH) { $script:pendingPosH = [double]$saved.posH }
             }
@@ -2778,7 +2822,9 @@ function Update-Wander {
         }
         if (-not $allowed) { return }
 
-        $wa = [System.Windows.SystemParameters]::WorkArea
+        # wander 在整个虚拟屏幕上活动（多屏时宠物能在所有屏上溜达），
+        # 与位置恢复/拖拽夹紧的坐标系一致。Get-WanderTarget/Clamped 本来就接受任意 bounds。
+        $wa = Get-VirtualScreenBounds
         $w = [double]$window.ActualWidth
         $h = [double]$window.ActualHeight
         if ($w -le 0 -or $h -le 0) { return }
@@ -3077,6 +3123,8 @@ $window.Add_MouseLeftButtonDown({
         $relPoint = [System.Windows.Input.Mouse]::GetPosition($window)
         $screenPoint = $window.PointToScreen($relPoint)
         $script:dragStart = @{
+            # PointToScreen 返回**物理像素**；$window.Left/Top 是 WPF **DIP**。
+            # 两套单位只在 100% 缩放时相等 —— 混用就是「高 DPI 下按不住/拖不动」的根因。
             screenX = $screenPoint.X
             screenY = $screenPoint.Y
             left    = $window.Left
@@ -3096,13 +3144,37 @@ $window.Add_MouseMove({
         if ($null -ne $script:dragStart -and $state.dragging) {
             $relPoint = [System.Windows.Input.Mouse]::GetPosition($window)
             $screenPoint = $window.PointToScreen($relPoint)
-            $deltaX = $screenPoint.X - $script:dragStart.screenX
-            $deltaY = $screenPoint.Y - $script:dragStart.screenY
+            # 物理位移 → DIP 位移：除以窗口当前 DPI 缩放比。
+            # 为什么每次 MouseMove 重算、而不是拖拽起点算一次：
+            # 系统 DPI 感知模式下窗口被拖到另一块缩放不同的屏时，
+            # TransformToDevice 会随窗口所在屏变化；起点算一次会在跨屏后失准。
+            # 鼠标事件频率下取一次矩阵的开销可忽略。
+            $m11 = 1.0
+            try {
+                $src = [System.Windows.PresentationSource]::FromVisual($window)
+                if ($src) { $m11 = [double]$src.CompositionTarget.TransformToDevice.M11 }
+            } catch { }
+            $deltaX = Convert-PxToDip ($screenPoint.X - $script:dragStart.screenX) $m11
+            $deltaY = Convert-PxToDip ($screenPoint.Y - $script:dragStart.screenY) $m11
             if ([math]::Abs($deltaX) -gt 3 -or [math]::Abs($deltaY) -gt 3) { $script:dragStart.moved = $true }
             if ($deltaX -gt 2) { $state.dragDir = 'running-right' }
             elseif ($deltaX -lt -2) { $state.dragDir = 'running-left' }
-            $window.Left = $script:dragStart.left + $deltaX
-            $window.Top  = $script:dragStart.top + $deltaY
+            $newLeft = $script:dragStart.left + $deltaX
+            $newTop  = $script:dragStart.top + $deltaY
+            # 实时夹紧：允许贴边（保留「拖到屏幕边缘」手感），但至少留 40px 宽/高可见，
+            # 防止甩飞窗口后找不回来。40px 是边缘处仍可抓回窗口的最小操作量。
+            try {
+                $vs = Get-VirtualScreenBounds
+                $w = [double]$window.ActualWidth
+                $h = [double]$window.ActualHeight
+                if ($w -gt 0 -and $h -gt 0) {
+                    $c = Get-ClampedPos $vs $w $h $newLeft $newTop 40.0
+                    $newLeft = $c.x
+                    $newTop = $c.y
+                }
+            } catch { }
+            $window.Left = $newLeft
+            $window.Top  = $newTop
         }
     } catch { Note-TickError 'drag-move' $_ }
 })
@@ -3196,12 +3268,13 @@ $window.Add_SizeChanged({
             $script:pendingPosH = 0.0
             $nl = [double]$window.Left + $adjW
             $nt = [double]$window.Top + $adjH
-            # 别把窗口还原到屏幕外（气泡长的时候底边可能超出工作区）
-            $wa = [System.Windows.SystemParameters]::WorkArea
-            if ($nl -lt $wa.Left) { $nl = $wa.Left }
-            if ($nl + $w -gt $wa.Right) { $nl = $wa.Right - $w }
-            if ($nt + $h -gt $wa.Bottom) { $nt = $wa.Bottom - $h }
-            if ($nt -lt $wa.Top) { $nt = $wa.Top }
+            # 别把窗口还原到屏幕外（气泡长的时候底边可能超出虚拟屏幕）。
+            # 用虚拟屏而不是 WorkArea：跨屏恢复的位置（如副屏在左侧时 Left 为负）
+            # 若在这里按主屏夹紧，会被拉回主屏、前功尽弃。
+            $vs = Get-VirtualScreenBounds
+            $c = Get-ClampedPos $vs $w $h $nl $nt 0.0
+            $nl = $c.x
+            $nt = $c.y
             $script:syncingSize = $true
             $window.Left = [math]::Round($nl)
             $window.Top = [math]::Round($nt)

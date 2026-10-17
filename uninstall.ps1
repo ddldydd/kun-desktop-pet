@@ -177,6 +177,41 @@ if (-not $RemoveAutostart) {
     }
 }
 
+# ---------------- 7. 桌面快捷方式 ----------------
+Write-Host ""
+Write-Host "7) 桌面快捷方式" -ForegroundColor Cyan
+
+try {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $shortcutPath = $null
+    if ($desktop) { $shortcutPath = Join-Path $desktop '启动桌宠.lnk' }
+
+    if ($shortcutPath -and (Test-Path -LiteralPath $shortcutPath)) {
+        # 只在快捷方式确实指向本次要卸载的安装目录时才删：
+        # 用户可能同时装了多个目录，误删别人的入口反而留下死链。
+        $pointsHere = $false
+        try {
+            $wsh = New-Object -ComObject WScript.Shell
+            $lnk = $wsh.CreateShortcut($shortcutPath)
+            $argsOf = [string]$lnk.Arguments
+            if ($targetFull -and $argsOf.IndexOf($targetFull, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $pointsHere = $true
+            }
+        } catch { }
+
+        if ($pointsHere) {
+            Remove-Item -LiteralPath $shortcutPath -Force
+            Ok ('已删除桌面快捷方式: ' + $shortcutPath)
+        } else {
+            Info ('桌面快捷方式指向别的安装目录，保留: ' + $shortcutPath)
+        }
+    } else {
+        Info '桌面没有「启动桌宠」快捷方式，跳过。'
+    }
+} catch {
+    Warn ('删除桌面快捷方式时出错（不影响卸载）: ' + $_.Exception.Message)
+}
+
 Write-Host ""
 Write-Host "卸载完成 ✓" -ForegroundColor Green
 Write-Host ""

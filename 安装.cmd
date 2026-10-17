@@ -53,6 +53,7 @@ if not "%RC%"=="0" (
   echo     Read the messages above for the reason.
 ) else (
   echo Done. The pet should now be on your desktop.
+  echo   A desktop shortcut to start the pet was also created.
   echo   Cannot see it? Press Win+D, or right-click the tray icon
   echo   and pick "reset position".
   echo.

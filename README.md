@@ -90,6 +90,12 @@ File ...\kun-pet-desktop.ps1 cannot be loaded because running scripts is disable
 
 它会自动完成：装桌宠本体 → 装形象素材 → 装 DSH 插件 / pi 扩展（**装了对应程序才会装，没装就跳过**）→ 启动桌宠。
 
+装完后：
+
+- 桌宠本体在 `%USERPROFILE%\kun-desktop-pet`；
+- **桌面会多出一个「启动桌宠」快捷方式**，以后双击它即可再次启动，不用再翻安装目录；
+- 不装素材、不装 DSH 也一样能双击快捷方式起来（桌宠会退回内置矢量形象 + 待机动画，见 [这是什么](#这是什么)）。
+
 > `安装.cmd` **不会**注册开机自启 —— 那应该是你自己的选择，不该是双击一次的副作用。
 > 需要自启请见 [可选：开机自启](#可选开机自启)。
 
@@ -123,6 +129,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 .\install.ps1 -InstallPlugin -Profile web
 .\install.ps1 -InstallPiExtension        # 顺带装 pi 扩展（补上「pi 正在等你确认」）
 .\install.ps1 -SkipAssets                # 不装素材（用内置矢量形象）
+.\install.ps1 -NoShortcut                # 不在桌面创建「启动桌宠」快捷方式
 .\install.ps1 -Target D:\pets\kun        # 装到别处
 ```
 
@@ -348,6 +355,9 @@ Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | Select-Object mode, upd
 > 更新源是 GitHub raw（`raw.githubusercontent.com`）。实测 `codeload.github.com`（zip 下载源）
 > 在部分网络下直连与代理都不通，而 raw 稳定可达且能正确保留 UTF-8 BOM，所以采用**逐文件下载**。
 
+> 更新只替换安装目录里的文件，**桌面上的「启动桌宠」快捷方式始终指向原安装目录**，
+> 所以更新后双击它照常启动、读的是同一份配置。
+
 > 如果更新后桌宠起不来：进 `backup-v<版本>-<时间戳>/` 目录，把里面的文件覆盖回桌宠目录即可。
 
 ---
@@ -552,6 +562,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-sour
 | 现象 | 处理 |
 |---|---|
 | 双击没反应 / 黑框一闪而过 | 右键用 PowerShell 运行 `kun-pet-desktop.ps1` 看完整报错；日志在同目录 `kun-pet-desktop.log` |
+| 桌面「启动桌宠」快捷方式不见了 / 双击报错 | 直接双击 `%USERPROFILE%\kun-desktop-pet\启动桌宠.vbs` 一样能启动；想重建快捷方式就重跑一次 `安装.cmd`（会覆盖旧的，不重复创建） |
 | 一直显示「DSH 没连上」 | 重启一次 DSH 桌面端，让插件接口生效；或忽略（不影响桌宠本身） |
 | **桌宠「不见了」** | 先看任务管理器里有没有 `kun-pet-desktop.ps1` 的 powershell 进程。桌宠是「置顶 + 分层 + 工具窗口」，Windows 里 `MainWindowHandle` 恒为 0，常规「找窗口」方法看不到它；它可能只是被别的全屏 / 置顶窗口压在下面。按 `Win+D` 显示桌面，或右键菜单「重置位置」把它拉回屏幕内 |
 | 小宠一闪一闪 | 已在 v2 修复（空帧跳过 + 固定缩放取整位移）。若你自己换的素材仍有此问题，用 `docs/` 里的方法检查每行有效帧数 |

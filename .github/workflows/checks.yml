@@ -213,6 +213,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::随机移动几何测试失败"; $fail = 1 }
           & ./desktop/tests/test-wander-guards.ps1
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::随机移动护栏测试失败"; $fail = 1 }
+          & ./desktop/tests/test-position.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::DPI/夹紧纯逻辑测试失败"; $fail = 1 }
           & ./desktop/tests/test-update.ps1
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::更新模块测试失败"; $fail = 1 }
           & ./desktop/tests/test-update-flow.ps1 ./desktop

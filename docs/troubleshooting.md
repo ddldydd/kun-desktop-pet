@@ -35,6 +35,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\add-bom.ps1 -Path . 
 > 后，用上面的 `add-bom.ps1` 补一次，否则 5.1 下又会解析失败。
 > 纯 ASCII 脚本（`KunPet-pet-running.ps1`、`add-bom.ps1` 自己）不受影响。
 
+### 桌面「启动桌宠」快捷方式不见了 / 双击报错
+
+安装完成后桌面会有一个「启动桌宠」快捷方式，指向 `%USERPROFILE%\kun-desktop-pet\启动桌宠.vbs`。
+
+- 找不到了：直接双击 `%USERPROFILE%\kun-desktop-pet\启动桌宠.vbs` 一样能启动，不用翻安装目录；
+- 想重建快捷方式：重跑一次根目录的 `安装.cmd`（或 `install.ps1`），它会**覆盖**旧的快捷方式、不会重复创建；
+- 不想要快捷方式：安装时加 `-NoShortcut`（`install.ps1 -NoShortcut`）；卸载时脚本会自动把它删掉。
+
 ### 双击没反应，或黑框一闪而过
 
 1. 用 PowerShell 直接跑脚本看完整报错：

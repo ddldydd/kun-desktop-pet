@@ -137,3 +137,62 @@ function Test-WanderAllowed($ctx) {
     if ([double]::IsNaN([double]$lx) -or [double]::IsNaN([double]$ty)) { return $false }   # 还没布局
     return $true
 }
+
+# =====================================================================
+#  DPI 缩放换算 + 位置夹紧（跨分辨率 / 多屏安全）
+# =====================================================================
+#  拖拽修复与位置恢复共用的纯函数，不碰 WPF，可脱离桌宠自测（tests/test-position.ps1）。
+#
+#  坐标单位约定（踩过的坑，务必看）：
+#    - 鼠标事件里 $window.PointToScreen(...) 返回**物理像素**；
+#    - $window.Left/Top 是 WPF **DIP（逻辑单位）**；
+#    - 两者只在 100% 缩放时相等。125%/150% 时物理位移是 DIP 位移的 1.25/1.5 倍，
+#      直接把物理位移累加到 Left/Top 会让桌宠跑得比鼠标快，表现就是「按不住 / 拖不动」。
+#  所以物理位移必须先除以窗口当前的 DPI 缩放比再累加。
+
+# 物理像素位移 → DIP 位移。$scale 是窗口当前 DPI 缩放比（TransformToDevice.M11）。
+# $scale <= 0 属于异常输入，按 1:1 原样返回（宁可退回旧行为，也不除零）。
+function Convert-PxToDip([double]$px, [double]$scale) {
+    if ($scale -le 0) { return $px }
+    return $px / $scale
+}
+
+# 把窗口左上角 (x, y) 夹进虚拟屏幕范围。
+#
+#   $bounds ：@{ Left; Top; Right; Bottom }（虚拟屏幕；Left/Top 允许为负 ——
+#             副屏在主屏左侧/上方时就是这样表示的）
+#   $winW/H ：窗口尺寸（DIP）
+#   $keepPx ：$keepPx <= 0 时**完整夹紧**（窗口整个落在屏内，位置恢复 / wander 用）；
+#             $keepPx > 0 时**部分可见夹紧**（允许越界但至少 $keepPx 宽/高留在屏内，
+#             拖拽实时夹紧用 —— 贴边拖动不被硬拽回，又不会整个飞出屏幕找不回来）。
+#
+# 返回 @{ x; y }；窗口比屏还大时退化为贴住左上角（与 Get-WanderClamped 一致）。
+function Get-ClampedPos($bounds, [double]$winW, [double]$winH, [double]$x, [double]$y, [double]$keepPx = 0.0) {
+    $minX = [double]$bounds.Left
+    $minY = [double]$bounds.Top
+    $maxX = [double]$bounds.Right
+    $maxY = [double]$bounds.Bottom
+    if ($keepPx -le 0) {
+        # 完整夹紧：左上角 x∈[minX, maxX-winW]，即窗口右/下边不越过屏的右/下边
+        $minKeepX = $minX
+        $minKeepY = $minY
+        $limitX = $maxX - $winW
+        $limitY = $maxY - $winH
+    } else {
+        # 部分可见：允许越界，但至少 $keepPx 宽/高落在屏内
+        $minKeepX = $minX - $winW + $keepPx
+        $minKeepY = $minY - $winH + $keepPx
+        $limitX = $maxX - $keepPx
+        $limitY = $maxY - $keepPx
+    }
+    # 窗口比「合法带」还大（缩放很大 / 气泡很长）：退化为贴住左上角
+    if ($limitX -lt $minKeepX) { $limitX = $minKeepX }
+    if ($limitY -lt $minKeepY) { $limitY = $minKeepY }
+    $cx = [double]$x
+    $cy = [double]$y
+    if ($cx -lt $minKeepX) { $cx = $minKeepX }
+    if ($cx -gt $limitX) { $cx = $limitX }
+    if ($cy -lt $minKeepY) { $cy = $minKeepY }
+    if ($cy -gt $limitY) { $cy = $limitY }
+    return @{ x = $cx; y = $cy }
+}
