@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.2.1'
+    Version     = '2.3.0'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -3299,4 +3299,27 @@ $window.Add_SizeChanged({
 })
 
 Write-Log 'UI ready, entering message loop'
+
+# 安装、升级、以及之后每次启动：桌面上要有「启动桌宠」。
+# 没有快捷方式，或还是旧的空白图标时，后台补一张宠物图标。
+# 已经是 KunPet 图标的不动，避免每次启动都换一只。
+try {
+    if (Get-Command -Name 'Ensure-PetDesktopShortcut' -ErrorAction SilentlyContinue) {
+        Ensure-PetDesktopShortcut -PetDir $script:logDir
+        Write-Log 'desktop shortcut ensure scheduled'
+    } else {
+        $maker = Join-Path $script:logDir 'make-shortcut.ps1'
+        if (Test-Path -LiteralPath $maker) {
+            $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            Start-Process -FilePath $psExe -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $maker,
+                '-PetDir', $script:logDir, '-Ensure'
+            ) -WindowStyle Hidden | Out-Null
+            Write-Log 'desktop shortcut ensure scheduled'
+        }
+    }
+} catch {
+    Write-Log ('desktop shortcut check failed: ' + $_.Exception.Message)
+}
+
 $null = $window.ShowDialog()

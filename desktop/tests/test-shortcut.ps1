@@ -68,6 +68,7 @@ if (-not (Test-Path -LiteralPath $lnkPath)) {
     CheckTrue 'TargetPath 指向 wscript.exe' ($lnk.TargetPath -and ($lnk.TargetPath -like '*\wscript.exe'))
     CheckTrue 'Arguments = 引号包裹的 vbs 路径' ($lnk.Arguments -eq $expArgs)
     CheckTrue 'WorkingDirectory = 安装目录' ($lnk.WorkingDirectory.TrimEnd('\') -eq $tmp.TrimEnd('\'))
+    CheckTrue 'IconLocation 指向 KunPet 宠物图标' ([string]$lnk.IconLocation -like '*\KunPet\kun-pet-*')
 }
 
 Write-Host ""
@@ -79,6 +80,7 @@ if (Test-Path -LiteralPath $lnkPath) {
     $wsh = New-Object -ComObject WScript.Shell
     $lnk = $wsh.CreateShortcut($lnkPath)
     CheckTrue '重复安装后仍指向正确' ($lnk.Arguments -eq $expArgs)
+    CheckTrue '重复安装后仍是宠物图标' ([string]$lnk.IconLocation -like '*\KunPet\kun-pet-*')
 }
 
 Write-Host ""

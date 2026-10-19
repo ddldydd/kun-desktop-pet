@@ -40,7 +40,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\add-bom.ps1 -Path . 
 安装完成后桌面会有一个「启动桌宠」快捷方式，指向 `%USERPROFILE%\kun-desktop-pet\启动桌宠.vbs`。
 
 - 找不到了：直接双击 `%USERPROFILE%\kun-desktop-pet\启动桌宠.vbs` 一样能启动，不用翻安装目录；
-- 想重建快捷方式：重跑一次根目录的 `安装.cmd`（或 `install.ps1`），它会**覆盖**旧的快捷方式、不会重复创建；
+- 想重建快捷方式：重跑一次根目录的 `安装.cmd`（或 `install.ps1`）。没有快捷方式会补上；还是空白图标会换成宠物图标；已经是宠物图标的不会被换掉；
 - 不想要快捷方式：安装时加 `-NoShortcut`（`install.ps1 -NoShortcut`）；卸载时脚本会自动把它删掉。
 
 ### 双击没反应，或黑框一闪而过

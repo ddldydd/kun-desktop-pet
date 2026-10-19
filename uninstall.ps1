@@ -183,13 +183,17 @@ Write-Host "7) 桌面快捷方式" -ForegroundColor Cyan
 
 try {
     $desktop = [Environment]::GetFolderPath('Desktop')
-    $shortcutPath = $null
-    if ($desktop) { $shortcutPath = Join-Path $desktop '启动桌宠.lnk' }
+    $names = @('启动桌宠.lnk', '坤桌宠.lnk')
+    $removedAny = $false
+    foreach ($name in $names) {
+        $shortcutPath = $null
+        if ($desktop) { $shortcutPath = Join-Path $desktop $name }
+        if (-not ($shortcutPath -and (Test-Path -LiteralPath $shortcutPath))) { continue }
 
-    if ($shortcutPath -and (Test-Path -LiteralPath $shortcutPath)) {
         # 只在快捷方式确实指向本次要卸载的安装目录时才删：
         # 用户可能同时装了多个目录，误删别人的入口反而留下死链。
         $pointsHere = $false
+        $icoPath = $null
         try {
             $wsh = New-Object -ComObject WScript.Shell
             $lnk = $wsh.CreateShortcut($shortcutPath)
@@ -197,15 +201,23 @@ try {
             if ($targetFull -and $argsOf.IndexOf($targetFull, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 $pointsHere = $true
             }
+            $iconLoc = [string]$lnk.IconLocation
+            $candidate = ($iconLoc -split ',')[0]
+            if ($candidate -like '*\KunPet\kun-pet-*.ico') { $icoPath = $candidate }
         } catch { }
 
         if ($pointsHere) {
             Remove-Item -LiteralPath $shortcutPath -Force
+            $removedAny = $true
             Ok ('已删除桌面快捷方式: ' + $shortcutPath)
+            if ($icoPath -and (Test-Path -LiteralPath $icoPath)) {
+                Remove-Item -LiteralPath $icoPath -Force -ErrorAction SilentlyContinue
+            }
         } else {
             Info ('桌面快捷方式指向别的安装目录，保留: ' + $shortcutPath)
         }
-    } else {
+    }
+    if (-not $removedAny -and $desktop -and -not (Test-Path -LiteralPath (Join-Path $desktop '启动桌宠.lnk'))) {
         Info '桌面没有「启动桌宠」快捷方式，跳过。'
     }
 } catch {

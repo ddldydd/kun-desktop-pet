@@ -297,27 +297,48 @@ Write-Host "4.5) 桌面快捷方式" -ForegroundColor Cyan
 if ($NoShortcut) {
     Info '已按 -NoShortcut 跳过（桌面上不会有「启动桌宠」快捷方式）'
 } else {
-    try {
-        # 桌面路径必须走系统 API：OneDrive 重定向等情况下 %USERPROFILE%\Desktop 会指错地方。
-        $desktop = [Environment]::GetFolderPath('Desktop')
-        if (-not $desktop -or -not (Test-Path -LiteralPath $desktop)) {
-            Warn '取不到桌面目录，跳过创建快捷方式。'
-        } else {
-            $shortcutPath = Join-Path $desktop '启动桌宠.lnk'
-            $wsh = New-Object -ComObject WScript.Shell
-            $lnk = $wsh.CreateShortcut($shortcutPath)
-            # 快捷方式指向 wscript.exe，参数是被引号包起来的启动器 .vbs，
-            # 工作目录设为安装目录（与手动双击启动器时一致，读同一份配置）。
-            $lnk.TargetPath = 'wscript.exe'
-            $lnk.Arguments = '"' + $petVbs + '"'
-            $lnk.WorkingDirectory = $targetFull
-            $lnk.Description = '启动 Kun Like 桌宠'
-            $lnk.Save()
-            Ok ('已创建桌面快捷方式: ' + $shortcutPath)
+    # 桌面路径必须走系统 API：OneDrive 重定向等情况下 %USERPROFILE%\Desktop 会指错地方。
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    if (-not $desktop -or -not (Test-Path -LiteralPath $desktop)) {
+        Warn '取不到桌面目录，跳过创建快捷方式。'
+    } else {
+        $shortcutPath = Join-Path $desktop '启动桌宠.lnk'
+        $made = $false
+        $maker = Join-Path $targetFull 'make-shortcut.ps1'
+        if (Test-Path -LiteralPath $maker) {
+            try {
+                $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $proc = Start-Process -FilePath $psExe -Wait -NoNewWindow -PassThru -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $maker,
+                    '-PetDir', $targetFull, '-Ensure'
+                )
+                if ($proc.ExitCode -eq 0 -and (Test-Path -LiteralPath $shortcutPath)) {
+                    $made = $true
+                    Ok ('已放好桌面快捷方式（宠物图标）: ' + $shortcutPath)
+                } else {
+                    Warn ('宠物图标快捷方式未做成（退出码 ' + $proc.ExitCode + '），改用普通快捷方式')
+                }
+            } catch {
+                Warn ('宠物图标快捷方式未做成，改用普通快捷方式: ' + $_.Exception.Message)
+            }
         }
-    } catch {
-        # 快捷方式属于锦上添花：失败绝不能阻断安装，桌宠本体已经装好了。
-        Warn ('创建桌面快捷方式失败，已跳过: ' + $_.Exception.Message)
+        if (-not $made) {
+            try {
+                $wsh = New-Object -ComObject WScript.Shell
+                $lnk = $wsh.CreateShortcut($shortcutPath)
+                # 快捷方式指向 wscript.exe，参数是被引号包起来的启动器 .vbs，
+                # 工作目录设为安装目录（与手动双击启动器时一致，读同一份配置）。
+                $lnk.TargetPath = 'wscript.exe'
+                $lnk.Arguments = '"' + $petVbs + '"'
+                $lnk.WorkingDirectory = $targetFull
+                $lnk.Description = '启动 Kun Like 桌宠'
+                $lnk.Save()
+                Ok ('已创建桌面快捷方式: ' + $shortcutPath)
+            } catch {
+                # 快捷方式属于锦上添花：失败绝不能阻断安装，桌宠本体已经装好了。
+                Warn ('创建桌面快捷方式失败，已跳过: ' + $_.Exception.Message)
+            }
+        }
     }
 }
 
