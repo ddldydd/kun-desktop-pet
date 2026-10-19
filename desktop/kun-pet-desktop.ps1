@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.3.0'
+    Version     = '2.4.0'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -105,6 +105,40 @@ try {
     Write-Log ("win32 interop unavailable: " + $_.Exception.Message)
 }
 
+# 拖拽热路径：GetCursorPos + SetWindowPos 全程走物理像素，一次移动窗口。
+# 不走 $window.Left/$window.Top（那是 DIP，而且分开赋值会触发两次布局）。
+# PowerShell 的 MouseMove 脚本块本身就慢，热路径里只做「读光标 → 算点 → 挪窗」。
+$script:windowDragAvailable = $false
+try {
+    if (-not ('KunPet.WindowDrag' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace KunPet {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DragPoint { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DragRect { public int Left; public int Top; public int Right; public int Bottom; }
+    public static class WindowDrag {
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out DragPoint lpPoint);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out DragRect lpRect);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_NOACTIVATE = 0x0010;
+        const uint SWP_MOVEFLAGS = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+        public static bool MoveTo(IntPtr hWnd, int x, int y) {
+            return SetWindowPos(hWnd, IntPtr.Zero, x, y, 0, 0, SWP_MOVEFLAGS);
+        }
+    }
+}
+'@
+    }
+    $script:windowDragAvailable = $true
+} catch {
+    Write-Log ("window drag helper unavailable: " + $_.Exception.Message)
+}
+
 # 素材逐行扫描：petdex/Codex 的精灵图每行末尾常有「空帧」（整格全透明），
 # 固定按 8 列循环会让小宠周期性消失一瞬——这就是频闪的根源。
 # 这里一次性扫出每行真正有内容的列号，动画只在这些列之间循环。
@@ -144,6 +178,38 @@ namespace KunPet {
     $script:spriteScanAvailable = $true
 } catch {
     Write-Log ("sprite scan helper unavailable: " + $_.Exception.Message)
+}
+
+# 托盘图标从快捷方式那张宠物图标里取。PrivateExtractIcons 不锁住 ico 文件，
+# 所以菜单里「换一张随机图标」可以覆盖 assets\kun-pet-icon.ico。
+$script:shellIconAvailable = $false
+try {
+    if (-not ('KunPet.ShellIcon' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Drawing;
+namespace KunPet {
+    public static class ShellIcon {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern uint PrivateExtractIcons(string szFileName, int nIconIndex, int cxIcon, int cyIcon,
+            IntPtr[] phicon, uint[] piconid, uint nIcons, uint flags);
+        public static Icon Load(string path, int size) {
+            IntPtr[] handles = new IntPtr[1];
+            uint[] ids = new uint[1];
+            uint n = PrivateExtractIcons(path, 0, size, size, handles, ids, 1, 0);
+            if (n == 0 || handles[0] == IntPtr.Zero) return null;
+            using (Icon tmp = Icon.FromHandle(handles[0])) {
+                return (Icon)tmp.Clone();
+            }
+        }
+    }
+}
+'@ -ReferencedAssemblies System.Drawing
+    }
+    $script:shellIconAvailable = $true
+} catch {
+    Write-Log ("shell icon helper unavailable: " + $_.Exception.Message)
 }
 
 # ---------------- 标准状态（与 Codex 桌宠九行一致） ----------------
@@ -446,10 +512,32 @@ try {
     $gfx.FillEllipse([System.Drawing.Brushes]::DodgerBlue, 2, 6, 28, 22)
     $gfx.FillEllipse([System.Drawing.Brushes]::White, 20, 10, 6, 5)
     $gfx.Dispose()
-    $notify.Icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $hIcon = $bmp.GetHicon()
+    $tmpIcon = [System.Drawing.Icon]::FromHandle($hIcon)
+    $notify.Icon = $tmpIcon.Clone()
+    $tmpIcon.Dispose()
+    $bmp.Dispose()
 } catch {
     $notify.Icon = [System.Drawing.SystemIcons]::Application
 }
+
+function Update-TrayIcon {
+    if (-not $script:shellIconAvailable) { return }
+    $ico = Join-Path $script:logDir 'assets\kun-pet-icon.ico'
+    if (-not (Test-Path -LiteralPath $ico)) { return }
+    try {
+        $icon = [KunPet.ShellIcon]::Load($ico, 32)
+        if ($null -eq $icon) { return }
+        $old = $notify.Icon
+        $notify.Icon = $icon
+        if ($old -and -not [object]::ReferenceEquals($old, [System.Drawing.SystemIcons]::Application)) {
+            try { $old.Dispose() } catch { }
+        }
+    } catch {
+        Write-Log ('tray icon: ' + $_.Exception.Message)
+    }
+}
+Update-TrayIcon
 
 # ---------------- 状态 ----------------
 $state = [hashtable]::Synchronized(@{
@@ -462,6 +550,8 @@ $state = [hashtable]::Synchronized(@{
     reactionEnd  = [datetime]::MinValue
     dragging     = $false
     dragDir      = 'running-right'
+    # 右键/托盘/Ctrl+, 菜单开着：走动暂停，动画少抢线程，菜单才不卡、宠物也不会跑走
+    menuOpen     = $false
     paused       = $false
     clickThrough = $false
     scale        = [double]$Config.Scale
@@ -528,7 +618,7 @@ $state = [hashtable]::Synchronized(@{
     wanderTargetX = $null      # 当前目标点（$null = 需要挑一个新的）
     wanderTargetY = $null
     wanderRestUntil = [datetime]::MinValue   # 走到目标后歇到什么时候
-    wanderLastDir = 'running-right'
+    wanderLastDir = 'idle'
     # ---- 临时提示（走气泡，不走弹窗）----
     # 为什么用气泡而不是 MessageBox：实测过（见 docs/internals.md）——
     # WinForms 的 MessageBox **不带 Topmost**，而桌宠本身是 Topmost，
@@ -959,20 +1049,65 @@ try {
     Write-Log ('wander module failed to load: ' + $_.Exception.Message)
 }
 
-# wander 模块缺失时（Test-Path 失败 / dot-source 抛错），Convert-PxToDip 与
-# Get-ClampedPos 也随之缺失。但拖拽 MouseMove 直接调用它们，函数不存在会抛
-# CommandNotFound、被外层 catch 吞掉（Note-TickError 'drag-move'）→ 拖拽从
-# 「高 DPI 不准」退化成「完全拖不动」，比修复前更糟。
-# 所以这里补 fallback：退化为 2.2.0 旧行为（1:1、不夹紧）——与「随机移动被
-# 禁用」的降级语义一致，可接受且最稳。位置恢复/SizeChanged 各自有 catch 兜底。
-# 注意只在未加载成功时定义，否则会覆盖 wander 模块里的正版实现。
-if (-not $script:wanderModuleLoaded) {
+# wander 模块缺失时，拖拽 MouseMove 仍会调用 Convert-PxToDip / Get-DragWindowPos。
+# 函数不存在会抛 CommandNotFound，被 drag-move 的 catch 吞掉 → 完全拖不动。
+# 这里退化为旧行为（1:1、不夹紧），比「拖不动」稳。
+if (-not (Get-Command -Name 'Convert-PxToDip' -CommandType Function -ErrorAction SilentlyContinue)) {
     function Convert-PxToDip([double]$px, [double]$scale) {
         if ($scale -le 0) { return $px }
-        return $px   # fallback：不换算（= 旧行为，仅 100% 缩放正确）
+        return $px
     }
+}
+if (-not (Get-Command -Name 'Get-ClampedPos' -CommandType Function -ErrorAction SilentlyContinue)) {
     function Get-ClampedPos($bounds, [double]$winW, [double]$winH, [double]$x, [double]$y, [double]$keepPx = 0.0) {
-        return @{ x = $x; y = $y }   # fallback：不夹紧（= 旧行为）
+        return @{ x = $x; y = $y }
+    }
+}
+if (-not (Get-Command -Name 'Get-DragWindowPos' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Get-DragWindowPos(
+        [double]$startLeft, [double]$startTop,
+        [double]$deltaPxX, [double]$deltaPxY,
+        [double]$scale,
+        $bounds, [double]$winW, [double]$winH, [double]$keepPx = 40.0
+    ) {
+        $dx = Convert-PxToDip $deltaPxX $scale
+        $dy = Convert-PxToDip $deltaPxY $scale
+        $dir = 'running-right'
+        if ($dx -lt -2.0) { $dir = 'running-left' }
+        return @{
+            left = ($startLeft + $dx); top = ($startTop + $dy)
+            moved = ([math]::Abs($dx) -gt 3.0 -or [math]::Abs($dy) -gt 3.0)
+            dir = $dir; deltaX = $dx; deltaY = $dy
+        }
+    }
+}
+if (-not (Get-Command -Name 'Get-PetTickPlan' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Get-PetTickPlan($ctx) {
+        $dragging = $false; $paused = $false; $menuOpen = $false; $walking = $false
+        if ($null -ne $ctx) {
+            if ($ctx.ContainsKey('dragging')) { $dragging = [bool]$ctx.dragging }
+            if ($ctx.ContainsKey('paused')) { $paused = [bool]$ctx.paused }
+            if ($ctx.ContainsKey('menuOpen')) { $menuOpen = [bool]$ctx.menuOpen }
+            if ($ctx.ContainsKey('walking')) { $walking = [bool]$ctx.walking }
+        }
+        $holdSize = ($dragging -or $menuOpen -or $walking)
+        return @{
+            updateSprite = ((-not $paused) -and (-not $menuOpen))
+            updateChrome = (-not $holdSize)
+            wander = ((-not $dragging) -and (-not $paused) -and (-not $menuOpen))
+            poll = (-not $holdSize)
+        }
+    }
+}
+if (-not (Get-Command -Name 'Get-HoverPauseState' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Get-HoverPauseState($prev, [bool]$over, $now, [int]$dwellMs = 300) {
+        if (-not $over) { return @{ overSince = $null; paused = $false } }
+        return @{ overSince = $now; paused = $true }
+    }
+}
+if (-not (Get-Command -Name 'Test-PointInRect' -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Test-PointInRect([double]$x, [double]$y, [double]$left, [double]$top, [double]$right, [double]$bottom) {
+        return ($x -ge $left -and $x -le $right -and $y -ge $top -and $y -le $bottom)
     }
 }
 
@@ -1018,15 +1153,23 @@ try {
 # 版本号以 version.json 为准（与更新源里那份同名文件同构），
 # 读不到就用 Config.Version 的兜底值 —— 这样「忘记同步版本号」不会让功能失效。
 $script:versionFile = Join-Path $script:logDir 'version.json'
+$script:cachedPetVersion = $null
 function Get-PetVersion {
+    if ($null -ne $script:cachedPetVersion -and $script:cachedPetVersion -ne '') {
+        return $script:cachedPetVersion
+    }
     try {
         if (Test-Path -LiteralPath $script:versionFile) {
             $m = Get-Content -LiteralPath $script:versionFile -Raw -Encoding UTF8 | ConvertFrom-Json
             $v = Get-ManifestVersion $m
-            if ($v) { return $v }
+            if ($v) {
+                $script:cachedPetVersion = $v
+                return $v
+            }
         }
     } catch { }
-    return [string]$Config.Version
+    $script:cachedPetVersion = [string]$Config.Version
+    return $script:cachedPetVersion
 }
 
 Function Get-StateFromHarness {
@@ -1624,8 +1767,8 @@ function Save-Settings {
     }
 }
 
-# 虚拟屏幕 bounds（多屏并集）。Left/Top 允许为负 —— 副屏在主屏左侧/上方时就是这样表示的。
-# 位置恢复 / 拖拽夹紧 / wander 都必须用它而不是 PrimaryScreen*（后者只描述主屏）。
+# 虚拟屏幕 bounds（多屏并集，DIP）。Left/Top 允许为负。
+# 位置恢复 / 拖拽夹紧都必须用它，而不是只看主屏 PrimaryScreen*。
 function Get-VirtualScreenBounds {
     $l = [double][System.Windows.SystemParameters]::VirtualScreenLeft
     $t = [double][System.Windows.SystemParameters]::VirtualScreenTop
@@ -1635,6 +1778,17 @@ function Get-VirtualScreenBounds {
         Right  = $l + [double][System.Windows.SystemParameters]::VirtualScreenWidth
         Bottom = $t + [double][System.Windows.SystemParameters]::VirtualScreenHeight
     }
+}
+
+function Get-WindowDpiScale($w) {
+    try {
+        $src = [System.Windows.PresentationSource]::FromVisual($w)
+        if ($src) {
+            $s = [double]$src.CompositionTarget.TransformToDevice.M11
+            if ($s -gt 0) { return $s }
+        }
+    } catch { }
+    return 1.0
 }
 
 function Load-Settings {
@@ -1684,14 +1838,9 @@ function Load-Settings {
         if ($null -ne $saved.wander) {
             $state.wanderEnabled = [bool]$saved.wander
         }
-        # 旧逻辑只看主屏（PrimaryScreen*）且要求 posLeft > -200：
-        # 副屏在主屏左侧时 Left 为负（如 -1920）会被误判非法，多屏用户每次启动丢位置；
-        # 换分辨率后也可能落屏外。改成按虚拟屏幕 + 窗口尺寸夹紧，允许负坐标。
         if ($null -ne $saved.posLeft -and $null -ne $saved.posTop) {
             try {
                 $vs = Get-VirtualScreenBounds
-                # 旧设置文件可能没有 posW/posH：夹紧时按「至少 120px 可见」的保守尺寸估算，
-                # 保证窗口能找回来；有尺寸则按完整窗口夹紧。
                 $cw = 120.0
                 $ch = 120.0
                 if ($null -ne $saved.posW -and [double]$saved.posW -gt 0) { $cw = [double]$saved.posW }
@@ -1699,11 +1848,9 @@ function Load-Settings {
                 $c = Get-ClampedPos $vs $cw $ch ([double]$saved.posLeft) ([double]$saved.posTop) 0.0
                 $window.Left = $c.x
                 $window.Top = $c.y
-                # 记下保存时的窗口尺寸：首次布局后按底边/中心校正（见 SizeChanged）
                 if ($null -ne $saved.posW) { $script:pendingPosW = [double]$saved.posW }
                 if ($null -ne $saved.posH) { $script:pendingPosH = [double]$saved.posH }
             } catch {
-                # 夹紧失败（如 wander 模块缺失）也不至于丢掉位置：退化为原样设置
                 $window.Left = [double]$saved.posLeft
                 $window.Top = [double]$saved.posTop
                 if ($null -ne $saved.posW) { $script:pendingPosW = [double]$saved.posW }
@@ -2487,6 +2634,58 @@ $miReset.add_Click({
     } catch { }
 })
 $menu.Items.Add($miReset) | Out-Null
+
+# 桌面快捷方式：随机挑一只已安装的宠物做成图标。再点一次会换一只 / 换一帧。
+$miShortcut = [System.Windows.Forms.ToolStripMenuItem]::new('创建桌面快捷方式')
+$miShortcut.add_Click({
+    try {
+        $maker = Join-Path $script:logDir 'make-shortcut.ps1'
+        if (-not (Test-Path -LiteralPath $maker)) {
+            Show-Notice '找不到快捷方式脚本' 8
+            return
+        }
+        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $psExe
+        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $maker + '" -PetDir "' + $script:logDir + '"'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        $proc.WaitForExit()
+        $stdout = ''
+        $stderr = ''
+        try { $stdout = [string]$outTask.Result } catch { }
+        try { $stderr = [string]$errTask.Result } catch { }
+        if ($proc.ExitCode -eq 0) {
+            Update-TrayIcon
+            $label = '随机小宠物'
+            $metaPath = Join-Path $script:logDir 'assets\kun-pet-icon.json'
+            if (Test-Path -LiteralPath $metaPath) {
+                try {
+                    $m = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                    if ($m.displayName) { $label = [string]$m.displayName }
+                } catch { }
+            }
+            Show-Notice ("桌面快捷方式已放好`n这次的图标是「{0}」" -f $label) 8
+            Write-Log ('desktop shortcut ready: ' + (($stdout -replace '\s+', ' ').Trim()))
+        } else {
+            Write-Log ('desktop shortcut failed: ' + $stderr)
+            Show-Notice '桌面快捷方式没做成，详情在日志里' 8
+        }
+    } catch {
+        Note-TickError 'shortcut' $_
+        Show-Notice '桌面快捷方式没做成' 8
+    }
+})
+$menu.Items.Add($miShortcut) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $miExit = [System.Windows.Forms.ToolStripMenuItem]::new('退出')
 $miExit.add_Click({
@@ -2498,6 +2697,32 @@ $menu.Items.Add($miExit) | Out-Null
 
 $notify.ContextMenuStrip = $menu
 $notify.Visible = $true
+
+# 菜单一开就冻住走动和重动画：否则鼠标移到菜单上会触发 MouseLeave，
+# hover 护栏失效，小宠接着跑，菜单既卡又对不着宠物。
+# Opening/Closed 同时覆盖右键、托盘图标、Ctrl+, 三条入口。
+$menu.add_Opening({
+    try { $state.menuOpen = $true } catch { }
+})
+$menu.add_Closed({
+    try {
+        $state.menuOpen = $false
+        # 关菜单后歇一小下，避免一松手就立刻冲走
+        if ($state.wanderEnabled) {
+            $state.wanderRestUntil = (Get-Date).AddMilliseconds(800)
+        }
+    } catch { }
+})
+
+function Show-PetMenu {
+    try {
+        $state.menuOpen = $true
+        $menu.Show([System.Windows.Forms.Cursor]::Position)
+    } catch {
+        $state.menuOpen = $false
+        Note-TickError 'show-menu' $_
+    }
+}
 
 # 宠物子菜单：内置 + 已发现素材
 function Rebuild-PetMenu {
@@ -2617,6 +2842,10 @@ $pollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $pollTimer.Interval = [TimeSpan]::FromMilliseconds($Config.PollMs)
 $pollTimer.Add_Tick({
     try {
+        # 拖拽时跳过：轮询会读会话文件 / 打 HTTP，占住 UI 线程，
+        # 跟 MouseMove 抢调度，窗口就会一顿一顿。拖一下通常不到 2 秒，漏一两轮没关系。
+        $tickPlan = Get-PetTickPlan @{ dragging = [bool]$state.dragging; paused = [bool]$state.paused; menuOpen = [bool]$state.menuOpen; walking = (Test-PetIsWalking) }
+        if (-not $tickPlan.poll) { return }
         # 注意：这里**不再**因为暂停而 return。暂停只冻结小宠的动画，
         # 任务气泡/进度/等待提示必须照常刷新（否则一暂停就什么都看不到了）。
         # 优先读会话投影缓存（始终可用），再退到插件端点，最后是活跃度兜底。
@@ -2798,16 +3027,55 @@ $pollTimer.Start()
 #   2) 暂停：暂停的语义是「冻结小宠」，这时候还满屏跑就自相矛盾
 #   3) 需要你介入（等审批 / 等回答）：审批面板上有 ✓/✗ 按钮，
 #      宠物一边飘一边等你点，按钮会跑掉，可能点错
-#   4) 鼠标悬停在宠物上：用户想点它 / 看清楚，这时别跑
-#   5) 鼠标穿透关闭时……不重要；穿透开着时本来就点不到，照常跑
+#   4) 鼠标在身体上停够一会儿：用户想点它 / 看清楚，这时别跑。
+#      路过或宠物自己走进光标，不能立刻刹停（那就是「走着走着卡一下」）。
+#   5) 右键/托盘菜单开着：鼠标会离开窗口，hover 护栏会失效，必须靠 menuOpen 刹住
+#   6) 鼠标穿透关闭时……不重要；穿透开着时本来就点不到，照常跑
 $script:wanderSpeed = 3.0          # 每帧像素（40ms/帧 → 约 75px/s，比走路慢一点，不吓人）
 $script:wanderRestMinMs = 1200     # 到达后最少歇多久
 $script:wanderRestMaxMs = 5000     # 最多歇多久
-$script:wanderHoverPause = $false  # 本帧鼠标是否停在宠物上（由 MouseEnter/Leave 维护）
+$script:wanderHoverPause = $false  # 经过 dwell 后才为 true（见 Update-WanderHover）
+$script:hoverPauseState = @{ overSince = $null; paused = $false }
+$script:wanderHoverDwellMs = 300
+
+function Get-PetBodyScreenRect {
+    # 只要小宠身体，不要整窗（气泡/提示很大，走过去会误停）
+    try {
+        if ($null -eq $petShellEl) { return $null }
+        $w = [double]$petShellEl.ActualWidth
+        $h = [double]$petShellEl.ActualHeight
+        if ($w -le 0 -or $h -le 0) { return $null }
+        $tl = $petShellEl.PointToScreen([System.Windows.Point]::new(0, 0))
+        $br = $petShellEl.PointToScreen([System.Windows.Point]::new($w, $h))
+        return @{ Left = [double]$tl.X; Top = [double]$tl.Y; Right = [double]$br.X; Bottom = [double]$br.Y }
+    } catch { return $null }
+}
+
+function Update-WanderHover {
+    $over = $false
+    try {
+        $body = Get-PetBodyScreenRect
+        if ($null -ne $body -and $script:windowDragAvailable) {
+            $pt = New-Object KunPet.DragPoint
+            if ([KunPet.WindowDrag]::GetCursorPos([ref]$pt)) {
+                $over = Test-PointInRect ([double]$pt.X) ([double]$pt.Y) $body.Left $body.Top $body.Right $body.Bottom
+            }
+        }
+    } catch { $over = $false }
+    $script:hoverPauseState = Get-HoverPauseState $script:hoverPauseState $over (Get-Date) $script:wanderHoverDwellMs
+    $script:wanderHoverPause = [bool]$script:hoverPauseState.paused
+}
+
+function Test-PetIsWalking {
+    if (-not [bool]$state.wanderEnabled) { return $false }
+    $dir = [string]$state.wanderLastDir
+    return ($dir -eq 'running-left' -or $dir -eq 'running-right')
+}
 
 function Update-Wander {
     try {
         if (-not $script:wanderModuleLoaded) { return }
+        Update-WanderHover
         # 所有「什么时候不许动」的判断都集中在模块的 Test-WanderAllowed 里。
         # 这样自测能直接验证那份逻辑本身，而不是验证一份可能走样的复制品。
         $allowed = Test-WanderAllowed @{
@@ -2815,6 +3083,7 @@ function Update-Wander {
             paused        = [bool]$state.paused
             dragging      = [bool]$state.dragging
             hover         = [bool]$script:wanderHoverPause
+            menuOpen      = [bool]$state.menuOpen
             waiting       = [bool]$state.waiting
             approvalCount = @($state.approvalItems).Count
             winLeft       = [double]$window.Left
@@ -2822,9 +3091,7 @@ function Update-Wander {
         }
         if (-not $allowed) { return }
 
-        # wander 在整个虚拟屏幕上活动（多屏时宠物能在所有屏上溜达），
-        # 与位置恢复/拖拽夹紧的坐标系一致。Get-WanderTarget/Clamped 本来就接受任意 bounds。
-        $wa = Get-VirtualScreenBounds
+        $wa = [System.Windows.SystemParameters]::WorkArea
         $w = [double]$window.ActualWidth
         $h = [double]$window.ActualHeight
         if ($w -le 0 -or $h -le 0) { return }
@@ -2872,6 +3139,7 @@ $animTimer.Interval = [TimeSpan]::FromMilliseconds($Config.AnimFpsMs)
 $animTimer.Add_Tick({
     try {
         $pausedNow = [bool]$state.paused
+        $tickPlan = Get-PetTickPlan @{ dragging = [bool]$state.dragging; paused = $pausedNow; menuOpen = [bool]$state.menuOpen; walking = (Test-PetIsWalking) }
         # 显示动作用局部变量，不回写 $state.action：
         # 拖拽/反应是临时覆盖，回写会导致松手后动作卡住不回待机
         $action = $state.action
@@ -2892,7 +3160,7 @@ $animTimer.Add_Tick({
         # 随机移动：先挪窗口（内部会自己判断能不能动），再决定播哪个动作。
         # 放在这里（而不是轮询定时器）是因为它要跟动画同步：40ms 一步走着才顺，
         # 500ms 一步会变成一跳一跳的。
-        Update-Wander
+        if ($tickPlan.wander) { Update-Wander }
         if (-not $state.dragging -and -not ($state.reaction -and (Get-Date) -lt $state.reactionEnd)) {
             $dir = [string]$state.wanderLastDir
             if ([bool]$state.wanderEnabled -and ($dir -eq 'running-left' -or $dir -eq 'running-right')) {
@@ -2925,7 +3193,8 @@ $animTimer.Add_Tick({
         $wobble = [double]$anim.wobble
         $floatX = 0.0
         $floatY = 0.0
-        if ($state.floating) {
+        # 拖着走的时候不要再做窗口内浮动：分层窗每帧重绘会跟 SetWindowPos 抢，更卡
+        if ($state.floating -and -not $state.dragging) {
             $floatY = [math]::Sin($script:phase) * $amp
             if ($wobble -gt 0) { $floatX = [math]::Sin($script:phase * 2.4) * $wobble }
         }
@@ -2956,6 +3225,10 @@ $animTimer.Add_Tick({
             Update-VectorLook $action
         }
         }   # ← 暂停分支结束：以下气泡/进度/提示在暂停时也照常刷新
+
+        # 拖拽中冻结气泡/底部提示：SizeToContent 一改字就改窗口尺寸，
+        # SizeChanged 再去改 Left/Top，跟鼠标抢位置，拖着就会卡。
+        if (-not $tickPlan.updateChrome) { return }
 
         # ---- 等待用户介入：气泡给「不一样的、看得懂」的提示 ----
         # 权限审批（桌宠上可直接 ✓/✗）与 Agent 提问（带选项）分开措辞，配色也不同，
@@ -3122,16 +3395,55 @@ $window.Add_MouseLeftButtonDown({
         # 不用 DragMove()：它是模态循环，拖动期间收不到 MouseMove，方向动画无法更新
         $relPoint = [System.Windows.Input.Mouse]::GetPosition($window)
         $screenPoint = $window.PointToScreen($relPoint)
+        $hwnd = [IntPtr]::Zero
+        $leftPx = 0; $topPx = 0; $winWpx = 0; $winHpx = 0
+        $cursorX = [int]$screenPoint.X; $cursorY = [int]$screenPoint.Y
+        $boundsPx = $null
+        $useWin32 = $false
+        if ($script:windowDragAvailable) {
+            try {
+                $hwnd = [System.Windows.Interop.WindowInteropHelper]::new($window).Handle
+                if ($hwnd -ne [IntPtr]::Zero) {
+                    $rc = New-Object KunPet.DragRect
+                    if ([KunPet.WindowDrag]::GetWindowRect($hwnd, [ref]$rc)) {
+                        $leftPx = [int]$rc.Left
+                        $topPx = [int]$rc.Top
+                        $winWpx = [int]($rc.Right - $rc.Left)
+                        $winHpx = [int]($rc.Bottom - $rc.Top)
+                    }
+                    $pt = New-Object KunPet.DragPoint
+                    if ([KunPet.WindowDrag]::GetCursorPos([ref]$pt)) {
+                        $cursorX = [int]$pt.X
+                        $cursorY = [int]$pt.Y
+                    }
+                    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                    $boundsPx = @{
+                        Left = [double]$vs.X; Top = [double]$vs.Y
+                        Right = [double]$vs.Right; Bottom = [double]$vs.Bottom
+                    }
+                    $useWin32 = $true
+                }
+            } catch { $useWin32 = $false }
+        }
         $script:dragStart = @{
-            # PointToScreen 返回**物理像素**；$window.Left/Top 是 WPF **DIP**。
-            # 两套单位只在 100% 缩放时相等 —— 混用就是「高 DPI 下按不住/拖不动」的根因。
-            screenX = $screenPoint.X
-            screenY = $screenPoint.Y
-            left    = $window.Left
-            top     = $window.Top
+            # PointToScreen / GetCursorPos 是物理像素；$window.Left/Top 是 DIP。
+            screenX = $cursorX
+            screenY = $cursorY
+            left    = [double]$window.Left
+            top     = [double]$window.Top
+            leftPx  = $leftPx
+            topPx   = $topPx
+            winWpx  = $winWpx
+            winHpx  = $winHpx
+            hwnd    = $hwnd
+            bounds  = $boundsPx
+            win32   = $useWin32
+            lastX   = $leftPx
+            lastY   = $topPx
             moved   = $false
         }
-        $state.dragging = $true
+        # 按下还不算拖：单击挥手不该把 dragging 拉起来，否则走动/气泡会被瞬间冻结，像卡停。
+        $state.dragging = $false
         $state.dragDir = 'running-right'
         try { $window.CaptureMouse() | Out-Null } catch { }
     } catch {
@@ -3141,40 +3453,49 @@ $window.Add_MouseLeftButtonDown({
 })
 $window.Add_MouseMove({
     try {
-        if ($null -ne $script:dragStart -and $state.dragging) {
-            $relPoint = [System.Windows.Input.Mouse]::GetPosition($window)
-            $screenPoint = $window.PointToScreen($relPoint)
-            # 物理位移 → DIP 位移：除以窗口当前 DPI 缩放比。
-            # 为什么每次 MouseMove 重算、而不是拖拽起点算一次：
-            # 系统 DPI 感知模式下窗口被拖到另一块缩放不同的屏时，
-            # TransformToDevice 会随窗口所在屏变化；起点算一次会在跨屏后失准。
-            # 鼠标事件频率下取一次矩阵的开销可忽略。
-            $m11 = 1.0
-            try {
-                $src = [System.Windows.PresentationSource]::FromVisual($window)
-                if ($src) { $m11 = [double]$src.CompositionTarget.TransformToDevice.M11 }
-            } catch { }
-            $deltaX = Convert-PxToDip ($screenPoint.X - $script:dragStart.screenX) $m11
-            $deltaY = Convert-PxToDip ($screenPoint.Y - $script:dragStart.screenY) $m11
-            if ([math]::Abs($deltaX) -gt 3 -or [math]::Abs($deltaY) -gt 3) { $script:dragStart.moved = $true }
-            if ($deltaX -gt 2) { $state.dragDir = 'running-right' }
-            elseif ($deltaX -lt -2) { $state.dragDir = 'running-left' }
-            $newLeft = $script:dragStart.left + $deltaX
-            $newTop  = $script:dragStart.top + $deltaY
-            # 实时夹紧：允许贴边（保留「拖到屏幕边缘」手感），但至少留 40px 宽/高可见，
-            # 防止甩飞窗口后找不回来。40px 是边缘处仍可抓回窗口的最小操作量。
-            try {
-                $vs = Get-VirtualScreenBounds
-                $w = [double]$window.ActualWidth
-                $h = [double]$window.ActualHeight
-                if ($w -gt 0 -and $h -gt 0) {
-                    $c = Get-ClampedPos $vs $w $h $newLeft $newTop 40.0
-                    $newLeft = $c.x
-                    $newTop = $c.y
+        if ($null -ne $script:dragStart) {
+            if ([bool]$script:dragStart.win32) {
+                $pt = New-Object KunPet.DragPoint
+                if (-not [KunPet.WindowDrag]::GetCursorPos([ref]$pt)) { return }
+                $p = Get-DragWindowPos `
+                    ([double]$script:dragStart.leftPx) ([double]$script:dragStart.topPx) `
+                    ([double]($pt.X - $script:dragStart.screenX)) `
+                    ([double]($pt.Y - $script:dragStart.screenY)) `
+                    1.0 $script:dragStart.bounds `
+                    ([double]$script:dragStart.winWpx) ([double]$script:dragStart.winHpx) 40.0
+                if ($p.moved) {
+                    $script:dragStart.moved = $true
+                    $state.dragging = $true
                 }
-            } catch { }
-            $window.Left = $newLeft
-            $window.Top  = $newTop
+                if (-not $state.dragging) { return }
+                if ([string]$state.dragDir -ne [string]$p.dir) { $state.dragDir = [string]$p.dir }
+                $nx = [int][math]::Round($p.left)
+                $ny = [int][math]::Round($p.top)
+                if ($nx -ne [int]$script:dragStart.lastX -or $ny -ne [int]$script:dragStart.lastY) {
+                    $script:dragStart.lastX = $nx
+                    $script:dragStart.lastY = $ny
+                    [void][KunPet.WindowDrag]::MoveTo($script:dragStart.hwnd, $nx, $ny)
+                }
+            } else {
+                # 回退：WPF Left/Top。PointToScreen 是像素，必须先换成 DIP。
+                $relPoint = [System.Windows.Input.Mouse]::GetPosition($window)
+                $screenPoint = $window.PointToScreen($relPoint)
+                $dpi = Get-WindowDpiScale $window
+                $vs = Get-VirtualScreenBounds
+                $p = Get-DragWindowPos `
+                    ([double]$script:dragStart.left) ([double]$script:dragStart.top) `
+                    ($screenPoint.X - $script:dragStart.screenX) `
+                    ($screenPoint.Y - $script:dragStart.screenY) `
+                    $dpi $vs ([double]$window.ActualWidth) ([double]$window.ActualHeight) 40.0
+                if ($p.moved) {
+                    $script:dragStart.moved = $true
+                    $state.dragging = $true
+                }
+                if (-not $state.dragging) { return }
+                $state.dragDir = [string]$p.dir
+                if ([double]$window.Left -ne [double]$p.left) { $window.Left = [double]$p.left }
+                if ([double]$window.Top -ne [double]$p.top) { $window.Top = [double]$p.top }
+            }
         }
     } catch { Note-TickError 'drag-move' $_ }
 })
@@ -3182,9 +3503,23 @@ $window.Add_MouseLeftButtonUp({
     try {
         if ($null -ne $script:dragStart) {
             $moved = [bool]$script:dragStart.moved
+            $hwnd = $script:dragStart.hwnd
+            $useWin32 = [bool]$script:dragStart.win32
             $script:dragStart = $null
             $state.dragging = $false
             try { $window.ReleaseMouseCapture() } catch { }
+            if ($useWin32 -and $hwnd -ne [IntPtr]::Zero) {
+                try {
+                    $rc = New-Object KunPet.DragRect
+                    if ([KunPet.WindowDrag]::GetWindowRect($hwnd, [ref]$rc)) {
+                        $dpi = Get-WindowDpiScale $window
+                        $nl = Convert-PxToDip ([double]$rc.Left) $dpi
+                        $nt = Convert-PxToDip ([double]$rc.Top) $dpi
+                        if ([double]$window.Left -ne $nl) { $window.Left = $nl }
+                        if ([double]$window.Top -ne $nt) { $window.Top = $nt }
+                    }
+                } catch { }
+            }
             if ($moved) { Save-Settings }
             if (-not $moved) {
                 if ($script:clickPending) {
@@ -3222,14 +3557,20 @@ $window.Add_KeyDown({
     try {
         if ($eventArgs.Key -eq [System.Windows.Input.Key]::OemComma -and
             ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control)) {
-            $menu.Show([System.Windows.Forms.Cursor]::Position)
+            Show-PetMenu
             $eventArgs.Handled = $true
         }
     } catch { }
 })
 # 右键 = 菜单
 $window.Add_MouseRightButtonUp({
-    try { $menu.Show([System.Windows.Forms.Cursor]::Position) } catch { }
+    param($sender, $eventArgs)
+    try {
+        Show-PetMenu
+        if ($eventArgs) { $eventArgs.Handled = $true }
+    } catch {
+        Note-TickError 'menu-right' $_
+    }
 })
 
 $window.Add_Closed({
@@ -3240,10 +3581,8 @@ $window.Add_Closed({
     Write-Log 'kun-pet-desktop stopped'
 })
 
-# 鼠标停在宠物上时暂停随机移动：用户想点它 / 想看清它在干嘛，这时候别自己跑掉。
-# 用 MouseEnter/Leave 维护一个标志，真正的判断在 Update-Wander 里。
-$window.Add_MouseEnter({ try { $script:wanderHoverPause = $true } catch { } })
-$window.Add_MouseLeave({ try { $script:wanderHoverPause = $false } catch { } })
+# 悬停停走不再听 MouseEnter/Leave：透明窗会丢事件，宠物自己走进光标也会误停。
+# 真实判断在 Update-WanderHover（光标 vs 身体矩形 + 300ms dwell）。
 
 # 气泡文字长短会让窗口尺寸变化（SizeToContent 从左上角扩展），
 # 小宠会跟着上下跳、左右移。这里把「底边 + 水平中心」钉住：
@@ -3256,6 +3595,8 @@ $script:pendingPosH = 0.0
 $window.Add_SizeChanged({
     try {
         if ($script:syncingSize) { return }
+        # 拖着或自己走路时别改 Left/Top：气泡/提示一变宽会把窗口拽回去，像卡停。
+        if ($state.dragging -or (Test-PetIsWalking)) { return }
         $w = [double]$window.ActualWidth
         $h = [double]$window.ActualHeight
         if ($w -le 0 -or $h -le 0) { return }
@@ -3268,13 +3609,12 @@ $window.Add_SizeChanged({
             $script:pendingPosH = 0.0
             $nl = [double]$window.Left + $adjW
             $nt = [double]$window.Top + $adjH
-            # 别把窗口还原到屏幕外（气泡长的时候底边可能超出虚拟屏幕）。
-            # 用虚拟屏而不是 WorkArea：跨屏恢复的位置（如副屏在左侧时 Left 为负）
-            # 若在这里按主屏夹紧，会被拉回主屏、前功尽弃。
-            $vs = Get-VirtualScreenBounds
-            $c = Get-ClampedPos $vs $w $h $nl $nt 0.0
-            $nl = $c.x
-            $nt = $c.y
+            # 别把窗口还原到屏幕外（气泡长的时候底边可能超出工作区）
+            $wa = [System.Windows.SystemParameters]::WorkArea
+            if ($nl -lt $wa.Left) { $nl = $wa.Left }
+            if ($nl + $w -gt $wa.Right) { $nl = $wa.Right - $w }
+            if ($nt + $h -gt $wa.Bottom) { $nt = $wa.Bottom - $h }
+            if ($nt -lt $wa.Top) { $nt = $wa.Top }
             $script:syncingSize = $true
             $window.Left = [math]::Round($nl)
             $window.Top = [math]::Round($nt)

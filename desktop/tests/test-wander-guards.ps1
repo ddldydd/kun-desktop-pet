@@ -46,6 +46,34 @@ CheckTrue '用户正在拖拽 → 不动（否则和鼠标抢窗口）' (-not (T
 $c = New-Ctx; $c.hover = $true
 CheckTrue '鼠标悬停在宠物上 → 不动（用户想点它）' (-not (Test-Allowed $c))
 
+Write-Host ""
+Write-Host "=== 悬停要 dwell，路过/自己走进鼠标不要立刻卡停 ===" -ForegroundColor Cyan
+$t0 = [datetime]'2026-01-01 12:00:00'
+$h = Get-HoverPauseState @{ overSince = $null; paused = $false } $false $t0 300
+CheckTrue '鼠标不在身上 → 不暂停' (-not [bool]$h.paused)
+CheckTrue '离开后清掉计时' ($null -eq $h.overSince)
+
+$h = Get-HoverPauseState @{ overSince = $null; paused = $false } $true $t0 300
+CheckTrue '刚移入（0ms）→ 还不暂停（避免路过/自己走进光标就急停）' (-not [bool]$h.paused)
+CheckTrue '开始计时' ($h.overSince -eq $t0)
+
+$h = Get-HoverPauseState @{ overSince = $t0; paused = $false } $true ($t0.AddMilliseconds(299)) 300
+CheckTrue '悬停 299ms < 300ms → 仍不暂停' (-not [bool]$h.paused)
+
+$h = Get-HoverPauseState @{ overSince = $t0; paused = $false } $true ($t0.AddMilliseconds(300)) 300
+CheckTrue '悬停满 300ms → 才暂停（真的想看它）' ([bool]$h.paused)
+
+$h = Get-HoverPauseState @{ overSince = $t0; paused = $true } $false ($t0.AddSeconds(1)) 300
+CheckTrue '移开立刻恢复走动，不要粘住' (-not [bool]$h.paused)
+CheckTrue '移开后计时清空（下次要重新 dwell）' ($null -eq $h.overSince)
+
+CheckTrue '点在宠物身体矩形内' (Test-PointInRect 50 50 0 0 100 100)
+CheckTrue '点在矩形外（气泡/空白）不算悬停' (-not (Test-PointInRect 150 50 0 0 100 100))
+CheckTrue '刚好在边上算里面' (Test-PointInRect 100 100 0 0 100 100)
+
+$c = New-Ctx; $c.menuOpen = $true
+CheckTrue '右键/托盘菜单正开着 → 不动（否则菜单还没点完它就跑走）' (-not (Test-Allowed $c))
+
 $c = New-Ctx; $c.waiting = $true
 CheckTrue '正在等你介入 → 不动（审批按钮不能被移走）' (-not (Test-Allowed $c))
 

@@ -119,7 +119,7 @@ function Get-WanderClamped($wa, [double]$winW, [double]$winH, [double]$x, [doubl
 # 测试照样全绿却什么也没保证。
 #
 # $ctx 是哈希表，字段容错（缺字段 = 不构成阻碍）：
-#   enabled / paused / dragging / hover / waiting / approvalCount / winLeft / winTop
+#   enabled / paused / dragging / hover / menuOpen / waiting / approvalCount / winLeft / winTop
 function Test-WanderAllowed($ctx) {
     $pick = {
         param($name, $default)
@@ -130,6 +130,7 @@ function Test-WanderAllowed($ctx) {
     if ([bool](& $pick 'paused' $false)) { return $false }             # 暂停 = 冻结小宠
     if ([bool](& $pick 'dragging' $false)) { return $false }           # 别跟鼠标抢窗口
     if ([bool](& $pick 'hover' $false)) { return $false }              # 用户想点它
+    if ([bool](& $pick 'menuOpen' $false)) { return $false }           # 右键/托盘菜单开着：别跑走
     if ([bool](& $pick 'waiting' $false)) { return $false }            # 等你介入，别把按钮移走
     if ([int](& $pick 'approvalCount' 0) -gt 0) { return $false }      # 审批面板正显示
     $lx = & $pick 'winLeft' 0.0
@@ -138,17 +139,44 @@ function Test-WanderAllowed($ctx) {
     return $true
 }
 
+# 点是否落在矩形内（含边）。用来判断光标是在小宠身体上，还是只在气泡/透明区。
+function Test-PointInRect([double]$x, [double]$y, [double]$left, [double]$top, [double]$right, [double]$bottom) {
+    return ($x -ge $left -and $x -le $right -and $y -ge $top -and $y -le $bottom)
+}
+
+# 悬停暂停要「停够一会儿」才生效。
+# 透明分层窗的 MouseEnter/Leave 会丢、会抖：宠物自己走进光标、或鼠标只是路过，
+# 立刻把 wander 刹停，观感就是「自己走着走着卡停一下」。
+# $prev: @{ overSince; paused }；$over=光标是否在身体上；$dwellMs=最短悬停毫秒。
+function Get-HoverPauseState($prev, [bool]$over, $now, [int]$dwellMs = 300) {
+    if ($dwellMs -lt 0) { $dwellMs = 0 }
+    if (-not $over) {
+        return @{ overSince = $null; paused = $false }
+    }
+    $since = $null
+    if ($null -ne $prev -and $prev.ContainsKey('overSince') -and $null -ne $prev.overSince) {
+        $since = $prev.overSince
+    }
+    if ($null -eq $since) { $since = $now }
+    $elapsed = 0.0
+    try { $elapsed = ([datetime]$now - [datetime]$since).TotalMilliseconds } catch { $elapsed = 0.0 }
+    return @{
+        overSince = $since
+        paused    = ($elapsed -ge [double]$dwellMs)
+    }
+}
+
 # =====================================================================
-#  DPI 缩放换算 + 位置夹紧（跨分辨率 / 多屏安全）
+#  DPI 缩放换算 + 位置夹紧 + 拖拽落点（跨分辨率 / 拖动跟手）
 # =====================================================================
-#  拖拽修复与位置恢复共用的纯函数，不碰 WPF，可脱离桌宠自测（tests/test-position.ps1）。
+#  不碰 WPF，可脱离桌宠自测（tests/test-position.ps1）。
 #
-#  坐标单位约定（踩过的坑，务必看）：
-#    - 鼠标事件里 $window.PointToScreen(...) 返回**物理像素**；
-#    - $window.Left/Top 是 WPF **DIP（逻辑单位）**；
-#    - 两者只在 100% 缩放时相等。125%/150% 时物理位移是 DIP 位移的 1.25/1.5 倍，
-#      直接把物理位移累加到 Left/Top 会让桌宠跑得比鼠标快，表现就是「按不住 / 拖不动」。
-#  所以物理位移必须先除以窗口当前的 DPI 缩放比再累加。
+#  坐标单位约定（踩过的坑）：
+#    - 鼠标 PointToScreen / GetCursorPos / SetWindowPos 用**物理像素**；
+#    - $window.Left/Top 是 WPF **DIP**；
+#    - 两者只在 100% 缩放时相等。125%/150% 时把像素位移直接加到 Left/Top，
+#      桌宠会比鼠标快，再叠上 SizeChanged 回拉，就是「拖着卡、跟不住」。
+#  物理位移必须先除以窗口当前 DPI 缩放比再累加。
 
 # 物理像素位移 → DIP 位移。$scale 是窗口当前 DPI 缩放比（TransformToDevice.M11）。
 # $scale <= 0 属于异常输入，按 1:1 原样返回（宁可退回旧行为，也不除零）。
@@ -161,7 +189,7 @@ function Convert-PxToDip([double]$px, [double]$scale) {
 #
 #   $bounds ：@{ Left; Top; Right; Bottom }（虚拟屏幕；Left/Top 允许为负 ——
 #             副屏在主屏左侧/上方时就是这样表示的）
-#   $winW/H ：窗口尺寸（DIP）
+#   $winW/H ：窗口尺寸（与 $x/$y/$bounds 同一单位：DIP 或像素都可以）
 #   $keepPx ：$keepPx <= 0 时**完整夹紧**（窗口整个落在屏内，位置恢复 / wander 用）；
 #             $keepPx > 0 时**部分可见夹紧**（允许越界但至少 $keepPx 宽/高留在屏内，
 #             拖拽实时夹紧用 —— 贴边拖动不被硬拽回，又不会整个飞出屏幕找不回来）。
@@ -173,19 +201,16 @@ function Get-ClampedPos($bounds, [double]$winW, [double]$winH, [double]$x, [doub
     $maxX = [double]$bounds.Right
     $maxY = [double]$bounds.Bottom
     if ($keepPx -le 0) {
-        # 完整夹紧：左上角 x∈[minX, maxX-winW]，即窗口右/下边不越过屏的右/下边
         $minKeepX = $minX
         $minKeepY = $minY
         $limitX = $maxX - $winW
         $limitY = $maxY - $winH
     } else {
-        # 部分可见：允许越界，但至少 $keepPx 宽/高落在屏内
         $minKeepX = $minX - $winW + $keepPx
         $minKeepY = $minY - $winH + $keepPx
         $limitX = $maxX - $keepPx
         $limitY = $maxY - $keepPx
     }
-    # 窗口比「合法带」还大（缩放很大 / 气泡很长）：退化为贴住左上角
     if ($limitX -lt $minKeepX) { $limitX = $minKeepX }
     if ($limitY -lt $minKeepY) { $limitY = $minKeepY }
     $cx = [double]$x
@@ -195,4 +220,59 @@ function Get-ClampedPos($bounds, [double]$winW, [double]$winH, [double]$x, [doub
     if ($cy -lt $minKeepY) { $cy = $minKeepY }
     if ($cy -gt $limitY) { $cy = $limitY }
     return @{ x = $cx; y = $cy }
+}
+
+# 一次拖拽 MouseMove 的落点：起点 + 像素位移（按 DPI 换成与起点相同的单位）+ 可选夹紧。
+# $bounds 为 $null 时只换算、不夹紧（便于单测「纯位移」）。
+# 返回 @{ left; top; moved; dir; deltaX; deltaY }
+function Get-DragWindowPos(
+    [double]$startLeft, [double]$startTop,
+    [double]$deltaPxX, [double]$deltaPxY,
+    [double]$scale,
+    $bounds, [double]$winW, [double]$winH, [double]$keepPx = 40.0
+) {
+    $dx = Convert-PxToDip $deltaPxX $scale
+    $dy = Convert-PxToDip $deltaPxY $scale
+    $moved = ([math]::Abs($dx) -gt 3.0 -or [math]::Abs($dy) -gt 3.0)
+    $dir = 'running-right'
+    if ($dx -lt -2.0) { $dir = 'running-left' }
+    elseif ($dx -gt 2.0) { $dir = 'running-right' }
+    $nx = $startLeft + $dx
+    $ny = $startTop + $dy
+    if ($null -ne $bounds) {
+        $c = Get-ClampedPos $bounds $winW $winH $nx $ny $keepPx
+        $nx = [double]$c.x
+        $ny = [double]$c.y
+    }
+    return @{
+        left   = $nx
+        top    = $ny
+        moved  = $moved
+        dir    = $dir
+        deltaX = $dx
+        deltaY = $dy
+    }
+}
+
+# 动画/轮询这一帧该干什么。拖拽时冻结气泡与磁盘/网络轮询：
+# SizeToContent 一改文字就会改窗口尺寸，SizeChanged 再去改 Left/Top，
+# 跟鼠标抢位置，这是 100% DPI 下「拖着卡」的主因。
+function Get-PetTickPlan($ctx) {
+    $dragging = $false
+    $paused = $false
+    $menuOpen = $false
+    $walking = $false
+    if ($null -ne $ctx) {
+        if ($ctx.ContainsKey('dragging') -and $null -ne $ctx.dragging) { $dragging = [bool]$ctx.dragging }
+        if ($ctx.ContainsKey('paused') -and $null -ne $ctx.paused) { $paused = [bool]$ctx.paused }
+        if ($ctx.ContainsKey('menuOpen') -and $null -ne $ctx.menuOpen) { $menuOpen = [bool]$ctx.menuOpen }
+        if ($ctx.ContainsKey('walking') -and $null -ne $ctx.walking) { $walking = [bool]$ctx.walking }
+    }
+    $holdSize = ($dragging -or $menuOpen -or $walking)
+    return @{
+        updateSprite = ((-not $paused) -and (-not $menuOpen))
+        updateChrome = (-not $holdSize)
+        wander       = ((-not $dragging) -and (-not $paused) -and (-not $menuOpen))
+        poll         = (-not $holdSize)
+    }
 }
