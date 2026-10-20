@@ -119,7 +119,7 @@ function Get-WanderClamped($wa, [double]$winW, [double]$winH, [double]$x, [doubl
 # 测试照样全绿却什么也没保证。
 #
 # $ctx 是哈希表，字段容错（缺字段 = 不构成阻碍）：
-#   enabled / paused / dragging / hover / menuOpen / waiting / approvalCount / winLeft / winTop
+#   enabled / paused / dragging / menuOpen / waiting / approvalCount / winLeft / winTop
 function Test-WanderAllowed($ctx) {
     $pick = {
         param($name, $default)
@@ -129,7 +129,6 @@ function Test-WanderAllowed($ctx) {
     if (-not [bool](& $pick 'enabled' $false)) { return $false }        # 功能没开
     if ([bool](& $pick 'paused' $false)) { return $false }             # 暂停 = 冻结小宠
     if ([bool](& $pick 'dragging' $false)) { return $false }           # 别跟鼠标抢窗口
-    if ([bool](& $pick 'hover' $false)) { return $false }              # 用户想点它
     if ([bool](& $pick 'menuOpen' $false)) { return $false }           # 右键/托盘菜单开着：别跑走
     if ([bool](& $pick 'waiting' $false)) { return $false }            # 等你介入，别把按钮移走
     if ([int](& $pick 'approvalCount' 0) -gt 0) { return $false }      # 审批面板正显示
@@ -142,28 +141,6 @@ function Test-WanderAllowed($ctx) {
 # 点是否落在矩形内（含边）。用来判断光标是在小宠身体上，还是只在气泡/透明区。
 function Test-PointInRect([double]$x, [double]$y, [double]$left, [double]$top, [double]$right, [double]$bottom) {
     return ($x -ge $left -and $x -le $right -and $y -ge $top -and $y -le $bottom)
-}
-
-# 悬停暂停要「停够一会儿」才生效。
-# 透明分层窗的 MouseEnter/Leave 会丢、会抖：宠物自己走进光标、或鼠标只是路过，
-# 立刻把 wander 刹停，观感就是「自己走着走着卡停一下」。
-# $prev: @{ overSince; paused }；$over=光标是否在身体上；$dwellMs=最短悬停毫秒。
-function Get-HoverPauseState($prev, [bool]$over, $now, [int]$dwellMs = 300) {
-    if ($dwellMs -lt 0) { $dwellMs = 0 }
-    if (-not $over) {
-        return @{ overSince = $null; paused = $false }
-    }
-    $since = $null
-    if ($null -ne $prev -and $prev.ContainsKey('overSince') -and $null -ne $prev.overSince) {
-        $since = $prev.overSince
-    }
-    if ($null -eq $since) { $since = $now }
-    $elapsed = 0.0
-    try { $elapsed = ([datetime]$now - [datetime]$since).TotalMilliseconds } catch { $elapsed = 0.0 }
-    return @{
-        overSince = $since
-        paused    = ($elapsed -ge [double]$dwellMs)
-    }
 }
 
 # =====================================================================

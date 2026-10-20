@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.1'
+    Version     = '2.4.2'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -1097,17 +1097,6 @@ if (-not (Get-Command -Name 'Get-PetTickPlan' -CommandType Function -ErrorAction
             wander = ((-not $dragging) -and (-not $paused) -and (-not $menuOpen))
             poll = (-not $holdSize)
         }
-    }
-}
-if (-not (Get-Command -Name 'Get-HoverPauseState' -CommandType Function -ErrorAction SilentlyContinue)) {
-    function Get-HoverPauseState($prev, [bool]$over, $now, [int]$dwellMs = 300) {
-        if (-not $over) { return @{ overSince = $null; paused = $false } }
-        return @{ overSince = $now; paused = $true }
-    }
-}
-if (-not (Get-Command -Name 'Test-PointInRect' -CommandType Function -ErrorAction SilentlyContinue)) {
-    function Test-PointInRect([double]$x, [double]$y, [double]$left, [double]$top, [double]$right, [double]$bottom) {
-        return ($x -ge $left -and $x -le $right -and $y -ge $top -and $y -le $bottom)
     }
 }
 
@@ -2703,8 +2692,8 @@ $menu.Items.Add($miExit) | Out-Null
 $notify.ContextMenuStrip = $menu
 $notify.Visible = $true
 
-# 菜单一开就冻住走动和重动画：否则鼠标移到菜单上会触发 MouseLeave，
-# hover 护栏失效，小宠接着跑，菜单既卡又对不着宠物。
+# 菜单一开就冻住走动和重动画：否则鼠标移到菜单上时小宠接着跑，
+# 菜单既卡又对不着宠物。
 # Opening/Closed 同时覆盖右键、托盘图标、Ctrl+, 三条入口。
 $menu.add_Opening({
     try { $state.menuOpen = $true } catch { }
@@ -3032,45 +3021,11 @@ $pollTimer.Start()
 #   2) 暂停：暂停的语义是「冻结小宠」，这时候还满屏跑就自相矛盾
 #   3) 需要你介入（等审批 / 等回答）：审批面板上有 ✓/✗ 按钮，
 #      宠物一边飘一边等你点，按钮会跑掉，可能点错
-#   4) 鼠标在身体上停够一会儿：用户想点它 / 看清楚，这时别跑。
-#      路过或宠物自己走进光标，不能立刻刹停（那就是「走着走着卡一下」）。
-#   5) 右键/托盘菜单开着：鼠标会离开窗口，hover 护栏会失效，必须靠 menuOpen 刹住
+#   4) 右键/托盘菜单开着：鼠标会离开窗口，必须靠 menuOpen 刹住
 #   6) 鼠标穿透关闭时……不重要；穿透开着时本来就点不到，照常跑
 $script:wanderSpeed = 3.0          # 每帧像素（40ms/帧 → 约 75px/s，比走路慢一点，不吓人）
 $script:wanderRestMinMs = 1200     # 到达后最少歇多久
 $script:wanderRestMaxMs = 5000     # 最多歇多久
-$script:wanderHoverPause = $false  # 经过 dwell 后才为 true（见 Update-WanderHover）
-$script:hoverPauseState = @{ overSince = $null; paused = $false }
-$script:wanderHoverDwellMs = 300
-
-function Get-PetBodyScreenRect {
-    # 只要小宠身体，不要整窗（气泡/提示很大，走过去会误停）
-    try {
-        if ($null -eq $petShellEl) { return $null }
-        $w = [double]$petShellEl.ActualWidth
-        $h = [double]$petShellEl.ActualHeight
-        if ($w -le 0 -or $h -le 0) { return $null }
-        $tl = $petShellEl.PointToScreen([System.Windows.Point]::new(0, 0))
-        $br = $petShellEl.PointToScreen([System.Windows.Point]::new($w, $h))
-        return @{ Left = [double]$tl.X; Top = [double]$tl.Y; Right = [double]$br.X; Bottom = [double]$br.Y }
-    } catch { return $null }
-}
-
-function Update-WanderHover {
-    $over = $false
-    try {
-        $body = Get-PetBodyScreenRect
-        if ($null -ne $body -and $script:windowDragAvailable) {
-            $pt = New-Object KunPet.DragPoint
-            if ([KunPet.WindowDrag]::GetCursorPos([ref]$pt)) {
-                $over = Test-PointInRect ([double]$pt.X) ([double]$pt.Y) $body.Left $body.Top $body.Right $body.Bottom
-            }
-        }
-    } catch { $over = $false }
-    $script:hoverPauseState = Get-HoverPauseState $script:hoverPauseState $over (Get-Date) $script:wanderHoverDwellMs
-    $script:wanderHoverPause = [bool]$script:hoverPauseState.paused
-}
-
 function Test-PetIsWalking {
     if (-not [bool]$state.wanderEnabled) { return $false }
     $dir = [string]$state.wanderLastDir
@@ -3080,14 +3035,12 @@ function Test-PetIsWalking {
 function Update-Wander {
     try {
         if (-not $script:wanderModuleLoaded) { return }
-        Update-WanderHover
         # 所有「什么时候不许动」的判断都集中在模块的 Test-WanderAllowed 里。
         # 这样自测能直接验证那份逻辑本身，而不是验证一份可能走样的复制品。
         $allowed = Test-WanderAllowed @{
             enabled       = [bool]$state.wanderEnabled
             paused        = [bool]$state.paused
             dragging      = [bool]$state.dragging
-            hover         = [bool]$script:wanderHoverPause
             menuOpen      = [bool]$state.menuOpen
             waiting       = [bool]$state.waiting
             approvalCount = @($state.approvalItems).Count
@@ -3586,8 +3539,8 @@ $window.Add_Closed({
     Write-Log 'kun-pet-desktop stopped'
 })
 
-# 悬停停走不再听 MouseEnter/Leave：透明窗会丢事件，宠物自己走进光标也会误停。
-# 真实判断在 Update-WanderHover（光标 vs 身体矩形 + 300ms dwell）。
+# 不做「鼠标停在小宠身上就刹停走动」：那是割裂感的来源 —— 想点/拖它时
+# 得先等它自己恢复。走动只受 拖拽 / 暂停 / 菜单 / 等待介入 这几条约束。
 
 # 气泡文字长短会让窗口尺寸变化（SizeToContent 从左上角扩展），
 # 小宠会跟着上下跳、左右移。这里把「底边 + 水平中心」钉住：
