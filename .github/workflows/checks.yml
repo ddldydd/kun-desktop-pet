@@ -178,6 +178,37 @@ jobs:
           if ($fail -ne 0) { exit 1 }
           Write-Host "网页内宠物已移除；Host 半区与三个端点齐备"
 
+      - name: 插件安装必须躲开 pnpm 剪枝（junction + .local-plugins）
+        shell: pwsh
+        run: |
+          # 实测踩到的坑：profile 用 nodeLinker: hoisted，pnpm 每次 install 都会把
+          # 「package.json 里没声明」的目录从 node_modules 剪到 node_modules\.ignored\。
+          # 插件一被剪走，/kun-pet/state 就 404，桌宠只剩读会话缓存的降级通道：
+          # 审批气泡不弹、桌宠上没有 ✓/✗，日志只有一行 plugin channel: unavailable。
+          # 所以 install.ps1 必须：① 正文放 .local-plugins\kun-pet；
+          # ② node_modules 里只放目录联接；③ uninstall 两处都清。
+          $fail = 0
+          $install = Get-Content ./install.ps1 -Raw
+          $uninstall = Get-Content ./uninstall.ps1 -Raw
+          if ($install -notmatch '\.local-plugins') {
+            Write-Host '::error::install.ps1 没有把插件正文放进 .local-plugins —— 会被 pnpm 剪掉'
+            $fail = 1
+          }
+          if ($install -notmatch 'ItemType Junction') {
+            Write-Host '::error::install.ps1 没有建目录联接 —— 直接拷贝会被 pnpm 剪掉'
+            $fail = 1
+          }
+          if ($install -notmatch '\.ignored') {
+            Write-Host '::error::install.ps1 没有清理历史被剪到 .ignored 的旧副本'
+            $fail = 1
+          }
+          if ($uninstall -notmatch '\.local-plugins') {
+            Write-Host '::error::uninstall.ps1 没有清 .local-plugins —— 卸载后会残留'
+            $fail = 1
+          }
+          if ($fail -ne 0) { exit 1 }
+          Write-Host '插件安装路径检查通过（.local-plugins + junction）'
+
       - name: Node 语法检查
         run: |
           # plugin/client.js（Harness 网页内的宠物渲染）已从仓库移除，

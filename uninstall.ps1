@@ -121,9 +121,38 @@ Write-Host "4) DSH 插件" -ForegroundColor Cyan
 if (-not $RemovePlugin) {
     Info '未删除（需要时加 -RemovePlugin）'
 } else {
-    $pluginDir = Join-Path $env:USERPROFILE ('.dsh\profiles\' + $Profile + '\node_modules\@local\kun-pet')
-    if (Test-Path $pluginDir) { Remove-Item -LiteralPath $pluginDir -Recurse -Force; Ok ("已删除插件 " + $pluginDir) }
-    else { Info ("插件不存在，跳过: " + $pluginDir) }
+    # 插件文件本体在 .local-plugins\kun-pet，node_modules 里只是一个目录联接。
+    # 两处都要清：先删 node_modules 里的链接（不删目标），再删本体。
+    $profileDir = Join-Path $env:USERPROFILE ('.dsh\profiles\' + $Profile)
+    $pluginLink = Join-Path $profileDir 'node_modules\@local\kun-pet'
+    $pluginStore = Join-Path $profileDir '.local-plugins\kun-pet'
+    # 坑：PowerShell 5.1 的 Remove-Item 删目录联接会抛 NullReferenceException 且删不掉，
+    # 只有 .NET 的 Directory.Delete(link, false) 能删链接而不碰目标内容（实测）。
+    if (Test-Path -LiteralPath $pluginLink) {
+        $li = Get-Item -LiteralPath $pluginLink -Force
+        if ($li.LinkType -eq 'Junction' -or $li.LinkType -eq 'SymbolicLink') {
+            [System.IO.Directory]::Delete($pluginLink, $false)
+        } else {
+            Remove-Item -LiteralPath $pluginLink -Recurse -Force
+        }
+        Ok ("已删除插件链接 " + $pluginLink)
+    } else {
+        Info ("插件链接不存在，跳过: " + $pluginLink)
+    }
+    if (Test-Path -LiteralPath $pluginStore) {
+        Remove-Item -LiteralPath $pluginStore -Recurse -Force
+        Ok ("已删除插件文件 " + $pluginStore)
+    } else {
+        Info ("插件文件不存在，跳过: " + $pluginStore)
+    }
+    # pnpm 早先剪进 .ignored 的副本也一并清掉
+    $ignoredLocal = Join-Path $profileDir 'node_modules\.ignored\@local'
+    if (Test-Path -LiteralPath $ignoredLocal) {
+        foreach ($stale in @(Get-ChildItem -LiteralPath $ignoredLocal -Force -ErrorAction SilentlyContinue |
+                             Where-Object { $_.Name -like 'kun-pet*' })) {
+            Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     $patch = Join-Path $env:USERPROFILE ('.dsh\profiles\' + $Profile + '\cordis.patch.yml')
     if (Test-Path $patch) {

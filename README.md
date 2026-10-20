@@ -278,11 +278,29 @@ Copy-Item .\assets\pets\* "$env:USERPROFILE\.petdex\pets\" -Recurse -Force
 
 安装（也可以让 `install.ps1 -InstallPlugin` 代劳）：
 
+> **别直接往 `node_modules` 里拷。** 实测踩到的坑：profile 用 `nodeLinker: hoisted`，
+> pnpm 每次 `install`（插件管理器装插件、dsh-sync 备份恢复都会触发）都会把
+> **`package.json` 里没声明**的目录剪到 `node_modules\.ignored\`。插件被剪走后
+> `/kun-pet/state` 就是 404，桌宠只剩「读会话缓存」的降级通道：审批气泡不弹、
+> 桌宠上也没有 ✓/✗，而日志只有一行 `plugin channel: unavailable` —— 极难看出是插件被剪了。
+> 正确做法是正文放 `node_modules` **之外**，`node_modules` 里只放一个目录联接。
+> `install.ps1 -InstallPlugin` 已经这么做了，手装照下面抄：
+
 ```powershell
 $profile = "$env:USERPROFILE\.dsh\profiles\desktop"        # 你的 profile 目录
-$dest    = Join-Path $profile "node_modules\@local\kun-pet"
-New-Item -ItemType Directory -Force $dest | Out-Null
-Copy-Item .\plugin\* $dest -Recurse -Force
+$store   = Join-Path $profile ".local-plugins\kun-pet"       # 正文：pnpm 不碰这里
+$link    = Join-Path $profile "node_modules\@local\kun-pet"   # 只是个联接
+New-Item -ItemType Directory -Force $store | Out-Null
+Copy-Item .\plugin\* $store -Recurse -Force
+
+# 已经存在就先清掉：注意 Remove-Item 删目录联接会抛 NullReferenceException，
+# 必须用 .NET 的 Directory.Delete（第二个参数 $false = 不碰目标内容）。
+if (Test-Path -LiteralPath $link) {
+    $li = Get-Item -LiteralPath $link -Force
+    if ($li.LinkType) { [System.IO.Directory]::Delete($link, $false) }
+    else { Remove-Item -LiteralPath $link -Recurse -Force }
+}
+New-Item -ItemType Junction -Path $link -Target $store | Out-Null
 ```
 
 然后在该 profile 的 `cordis.patch.yml` 末尾追加：
@@ -568,6 +586,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-sour
 | 小宠一闪一闪 | 已在 v2 修复（空帧跳过 + 固定缩放取整位移）。若你自己换的素材仍有此问题，用 `docs/` 里的方法检查每行有效帧数 |
 | 素材在菜单里显示「需 WebP 扩展」 | 该素材只有 `.webp`，转成 `.png` 或装 Windows「Webp 图像扩展」 |
 | 审批气泡不弹 | 插件没加载：`http://127.0.0.1:19387/kun-pet/state` 返回 404 ⇒ 重启 DSH；再看 `~/.dsh/kun-pet-host.log` |
+| 审批气泡本来能用，装了别的插件后突然不弹了 | **插件被 pnpm 剪走了**（v2.4.1 修）：看 `<profile>\node_modules\.ignored\@local\` 里有没有 `kun-pet*`。有就说明被剪了 —— 重跑 `安装.cmd`（或 `install.ps1 -InstallPlugin`）会改回「目录联接 + `.local-plugins`」的装法，之后 pnpm 再怎么装包都不会动它 |
 | 在桌宠上点了同意，Harness 卡片还挂着 | 旧版问题，已修（桌宠应答时会顺手 cancel 网页端那张远程卡片）；DSH 版本差异导致取不到内部结构时，会自动退回「先给桌宠 6 秒独占窗口」的兜底策略 |
 
 更细的原理与自查脚本见 [docs/internals.md](docs/internals.md) 与 [docs/troubleshooting.md](docs/troubleshooting.md)。
@@ -579,7 +598,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-sour
 1. 右键托盘图标 → **退出**（结束桌宠）；
 2. 删掉桌宠所在目录；
 3. 若装了自启，删掉「启动」文件夹里的 `KunPet-autostart.cmd` 与 `KunPet-pet-running.ps1`；
-4. 若装了插件，删掉 `<profile>\node_modules\@local\kun-pet` 并移除 `cordis.patch.yml` 里的 `kun-pet` insert 项；
+4. 若装了插件，删掉 `<profile>\node_modules\@local\kun-pet`（是个目录联接，用 `[IO.Directory]::Delete($link, $false)` 删，`Remove-Item` 会抛异常）与 `<profile>\.local-plugins\kun-pet`，再移除 `cordis.patch.yml` 里的 `kun-pet` insert 项；
 5. 素材在 `%USERPROFILE%\.petdex\pets\`，不需要就一并删除。
 
 或者直接：

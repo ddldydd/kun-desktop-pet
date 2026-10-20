@@ -176,8 +176,26 @@ if (-not $InstallPlugin) {
         Warn ("profile 目录不存在: " + $profileDir)
         Warn '先启动一次 DSH 让它生成 profile，或换 -Profile <名字>。插件未安装。'
     } else {
+        # ---- 装到哪里：**不能**直接放进 node_modules ----
+        # 实测踩到的坑（2026-10 本机复现）：
+        #   profile 用 nodeLinker: hoisted，pnpm 每次 install 都会把「package.json 里
+        #   没声明」的目录从 node_modules 剪到 node_modules\.ignored\ —— 现场留下
+        #   .ignored\@local\kun-pet、kun-pet_1、kun-pet_2 三份。插件一被剪走，
+        #   /kun-pet/state 就 404，桌宠只剩下「读会话缓存」的降级通道：
+        #   审批气泡不弹、桌宠上也没有 ✓/✗ 按钮，而日志只写一行
+        #   "plugin channel: unavailable"，极难看出是插件被剪了。
+        # 为什么会剪：pnpm 只保留它自己安装过的包；手工塞进去的目录算「多余」。
+        #
+        # 所以真正的内容放在 .local-plugins\kun-pet（node_modules 之外，pnpm 不碰），
+        # node_modules\@local\kun-pet 只放一个**目录联接（junction）**指过去。
+        # 实测：真目录会被剪，junction 在普通 install / 增删依赖 / --force /
+        # --frozen-lockfile 下都原样保留。
+        # 刻意**不**往 profile 的 package.json 里加 link: 依赖：那会让 pnpm-lock.yaml
+        # 不同步，DSH 自己用 --frozen-lockfile 装插件时会整批报
+        # ERR_PNPM_OUTDATED_LOCKFILE（也实测过），风险远大于收益。
+        $pluginStore = Join-Path $profileDir '.local-plugins\kun-pet'
         $dest = Join-Path $profileDir 'node_modules\@local\kun-pet'
-        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+        New-Item -ItemType Directory -Force -Path $pluginStore | Out-Null
         # 只装 Host 半区（index.js + package.json）。
         # **刻意不装 client.js**：那是「Harness 网页里那只宠物」的渲染代码。
         # 桌面宠物需要的是 Host 半区提供的 /kun-pet/state 与 /kun-pet/approval，
@@ -187,10 +205,60 @@ if (-not $InstallPlugin) {
         foreach ($f in $hostHalf) {
             $src = Join-Path $srcPlugin $f
             if (Test-Path -LiteralPath $src) {
-                Copy-Item -LiteralPath $src -Destination (Join-Path $dest $f) -Force
+                Copy-Item -LiteralPath $src -Destination (Join-Path $pluginStore $f) -Force
             }
         }
-        Ok ("插件文件已装（Host 半区，不含网页宠物）: " + $dest)
+        Ok ("插件文件已装（Host 半区，不含网页宠物）: " + $pluginStore)
+
+        # node_modules 那一侧：先清掉任何「真目录」（老版本直接拷到这里来的），
+        # 再建 junction。
+        # 坑：PowerShell 5.1 的 Remove-Item 删目录联接会抛
+        # NullReferenceException（实测），而且链接还留在原地 —— 于是每次重装都失败。
+        # 只有 [IO.Directory]::Delete($link, $false) 能正确删掉链接、且不碰目标内容。
+        $linkParent = Split-Path -Parent $dest
+        if (-not (Test-Path -LiteralPath $linkParent)) {
+            New-Item -ItemType Directory -Force -Path $linkParent | Out-Null
+        }
+        $linkReady = $false
+        try {
+            if (Test-Path -LiteralPath $dest) {
+                $existing = Get-Item -LiteralPath $dest -Force
+                $isLink = ($existing.LinkType -eq 'Junction' -or $existing.LinkType -eq 'SymbolicLink')
+                if ($isLink) {
+                    # 已经是链接：指向对就留着，指错就重建
+                    if ($existing.Target -and (@($existing.Target) -join '') -like "*$pluginStore*") {
+                        $linkReady = $true
+                    } else {
+                        [System.IO.Directory]::Delete($dest, $false)
+                    }
+                } else {
+                    Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop
+                }
+            }
+            if (-not $linkReady) {
+                New-Item -ItemType Junction -Path $dest -Target $pluginStore -ErrorAction Stop | Out-Null
+                $linkReady = $true
+            }
+        } catch {
+            # 拿不到 junction 权限（极少数环境）就退回「直接拷贝」：
+            # 功能立刻可用，只是将来 pnpm 装包时可能被剪，届时重跑安装即可。
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            foreach ($f in $hostHalf) {
+                $src = Join-Path $pluginStore $f
+                if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $dest $f) -Force }
+            }
+            Warn ("无法建立目录联接，已退回直接拷贝（将来 pnpm 装包时可能被剪掉，重跑安装即可）: " + $_.Exception.Message)
+        }
+        if ($linkReady) { Ok ("已把 node_modules\@local\kun-pet 指向它（目录联接，pnpm 不会剪掉）") }
+
+        # 清掉 pnpm 早先剪进 .ignored 的旧副本：它们不会再被加载，
+        # 留着只会让排查时误以为「插件装着」。
+        try {
+            foreach ($staleIgnored in @(Get-ChildItem -LiteralPath (Join-Path $profileDir 'node_modules\.ignored\@local') -Force -ErrorAction SilentlyContinue |
+                                        Where-Object { $_.Name -like 'kun-pet*' })) {
+                Remove-Item -LiteralPath $staleIgnored.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
 
         # 清掉历史安装遗留的 client.js：早期版本装过它，残留会让网页宠物继续出现
         # （DSH 按 package.json 的 dsh.client 声明去找，但文件在就会被注入）。

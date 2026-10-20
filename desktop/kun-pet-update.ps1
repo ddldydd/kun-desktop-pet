@@ -228,6 +228,31 @@ function Test-UpdateContent([string]$name, [string]$text) {
     return @{ ok = $true; reason = '' }
 }
 
+# 把启动器（.vbs / .bat / .cmd）的行尾统一成 CRLF。
+# 只碰这三种扩展名，且只把「裸 LF」换成 CRLF：已经 CRLF 的不动，
+# 二进制/脚本（.ps1/.json/.png…）一个字节都不改。
+# 为什么需要：GitHub raw 返回的是仓库里的原始字节，启动器在仓库里是 LF
+# （.gitattributes 的 eol=crlf 只在 git checkout 时生效，raw 不转换），
+# 直接落盘会让 .bat/.vbs 变成 LF —— 见调用处的说明。
+function ConvertTo-CrlfIfLauncher([string]$name, [byte[]]$bytes) {
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return $bytes }
+    $ext = [System.IO.Path]::GetExtension([string]$name).ToLowerInvariant()
+    if ($ext -ne '.vbs' -and $ext -ne '.bat' -and $ext -ne '.cmd') { return $bytes }
+    $out = New-Object System.Collections.Generic.List[byte]
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        $b = $bytes[$i]
+        if ($b -eq 10) {
+            # 前面已经是 CR 就不重复加
+            if ($i -gt 0 -and $bytes[$i - 1] -eq 13) { $out.Add($b); continue }
+            $out.Add([byte]13)
+            $out.Add([byte]10)
+        } else {
+            $out.Add($b)
+        }
+    }
+    return $out.ToArray()
+}
+
 # ---------------- 原子替换与回滚 ----------------
 # 把一组「已下载并校验过」的文件装进目标目录。
 #
@@ -273,7 +298,15 @@ function Install-UpdateFiles($staged, [string]$targetDir, [string]$backupRoot, [
 
         # ---- 2) 逐文件原子替换 ----
         foreach ($name in $staged.Keys) {
-            $bytes = $staged[$name].bytes
+            # .vbs / .bat / .cmd 落盘前统一成 CRLF。
+            # 为什么必须在这里做：更新源是 GitHub raw，它按**仓库里存的字节**原样返回，
+            # 而仓库里 .ps1 是 LF（.gitattributes 定的）。启动器那三个文件仓库声明的是
+            # eol=crlf，但 raw 给出来的仍是 LF —— git 只在 checkout 时转换，raw 不转。
+            # 实测：更新一次之后磁盘上的 启动桌宠.vbs / .bat 变成 LF。
+            # cmd.exe 对 LF 结尾的 .bat 在部分系统/分支结构上会出错（goto/label 尤甚），
+            # 这正是仓库里那条「启动器必须 CRLF」CI 检查要防的事，所以落盘前补齐，
+            # 否则一次更新就把 CI 想守住的不变量破坏了。
+            $bytes = ConvertTo-CrlfIfLauncher $name $staged[$name].bytes
             $dst = Join-Path $targetDir $name
             $tmp = Join-Path $targetDir ($name + '.new-tmp')
             # 先把新内容完整写到同目录的 .tmp（同卷，改名/替换才是原子的）

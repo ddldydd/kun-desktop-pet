@@ -16,6 +16,14 @@ function Check([string]$name, $actual, $expected) {
     else { $script:fail++; Write-Host ("  [FAIL] {0}  期望={1} 实际={2}" -f $name, $e, $a) -ForegroundColor Red }
 }
 function CheckTrue([string]$name, $c) { Check $name $(if ($c) { 'True' } else { 'False' }) 'True' }
+# 字节数组里是否存在「裸 LF」（前面不是 CR）
+function Test-BytesHaveLoneLf([byte[]]$b) {
+    if ($null -eq $b) { return $false }
+    for ($i = 0; $i -lt $b.Length; $i++) {
+        if ($b[$i] -eq 10 -and ($i -eq 0 -or $b[$i - 1] -ne 13)) { return $true }
+    }
+    return $false
+}
 
 $here = $PSScriptRoot
 if (-not $here) { $here = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -217,6 +225,49 @@ if (Test-Path -LiteralPath $vjPath) {
     }
 }
 
+Write-Host ""
+Write-Host "=== 9. 启动器落盘必须 CRLF（更新写入磁盘时的行尾归一）===" -ForegroundColor Cyan
+# 背景：更新源是 GitHub raw，返回的是仓库里的原始字节（.vbs/.bat 在仓库里是 LF），
+# 直接落盘会把启动器写成 LF —— 实测确认过（更新一次后 启动桌宠.vbs 变成 LF）。
+# CI 里那条「启动器必须是 CRLF」的检查要防的就是这类破坏，所以这里钉住转换函数。
+function Get-AsciiBytes([string]$s) { return [System.Text.Encoding]::ASCII.GetBytes($s) }
+$lfText = "@echo off`nrem a`nrem b`n"
+$crlfText = "@echo off`r`nrem a`r`n"
+$bLf = Get-AsciiBytes $lfText
+$bCrlf = Get-AsciiBytes $crlfText
+$out1 = ConvertTo-CrlfIfLauncher 'start.bat' $bLf
+CheckTrue 'LF 的 .bat 落盘前变成 CRLF' ((Test-BytesHaveLoneLf $out1) -eq $false)
+CheckTrue '转换后每个 LF 多一个 CR（3 个）' ($out1.Length -eq ($bLf.Length + 3))
+$out2 = ConvertTo-CrlfIfLauncher 'start.vbs' $bLf
+CheckTrue '.vbs 同样转换' ($out2.Length -eq ($bLf.Length + 3))
+$out3 = ConvertTo-CrlfIfLauncher 'tool.cmd' $bLf
+CheckTrue '.cmd 同样转换' ($out3.Length -eq ($bLf.Length + 3))
+$out4 = ConvertTo-CrlfIfLauncher 'x.bat' $bCrlf
+CheckTrue '已经是 CRLF 的不重复加 CR（幂等）' ($out4.Length -eq $bCrlf.Length)
+$bPs1 = Get-AsciiBytes $lfText
+CheckTrue '.ps1 一个字节都不动（仓库约定 LF）' ((ConvertTo-CrlfIfLauncher 'kun-pet-ui.ps1' $bPs1).Length -eq $bPs1.Length)
+CheckTrue '.json 不动' ((ConvertTo-CrlfIfLauncher 'version.json' $bPs1).Length -eq $bPs1.Length)
+$emptyOk = $true
+try { [void](ConvertTo-CrlfIfLauncher 'a.bat' ([byte[]]@())) } catch { $emptyOk = $false }
+CheckTrue '空字节数组不抛异常' $emptyOk
+
+Write-Host ""
+Write-Host "=== 10. 端到端：更新写入磁盘后启动器仍是 CRLF（不联网）===" -ForegroundColor Cyan
+$tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('kun-crlf-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+try {
+    $stagedCrlf = @{}
+    $stagedCrlf['l.bat'] = @{ bytes = (Get-AsciiBytes "@echo off`nrem a`n") }
+    $stagedCrlf['l.vbs'] = @{ bytes = (Get-AsciiBytes "Option Explicit`nWScript.Quit`n") }
+    $stagedCrlf['m.ps1'] = @{ bytes = (Get-AsciiBytes "function X { }`n") }
+    $rr = Install-UpdateFiles $stagedCrlf $tmpDir $tmpDir '9.9.9'
+    CheckTrue '安装成功' ($rr.ok)
+    CheckTrue '落盘的 .bat 是 CRLF' ((Test-BytesHaveLoneLf ([IO.File]::ReadAllBytes((Join-Path $tmpDir 'l.bat')))) -eq $false)
+    CheckTrue '落盘的 .vbs 是 CRLF' ((Test-BytesHaveLoneLf ([IO.File]::ReadAllBytes((Join-Path $tmpDir 'l.vbs')))) -eq $false)
+    CheckTrue '落盘的 .ps1 保持 LF（没被误改）' (Test-BytesHaveLoneLf ([IO.File]::ReadAllBytes((Join-Path $tmpDir 'm.ps1'))))
+} finally {
+    Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 Write-Host ""
 if ($script:fail -eq 0) { Write-Host ("全部通过：{0} 项" -f $script:pass) -ForegroundColor Green; exit 0 }
 else { Write-Host ("失败 {0} 项 / 通过 {1} 项" -f $script:fail, $script:pass) -ForegroundColor Red; exit 1 }

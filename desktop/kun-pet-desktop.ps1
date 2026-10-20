@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.0'
+    Version     = '2.4.1'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -2596,9 +2596,14 @@ function Restart-Pet {
                  "`$cwd='$base'; " +
                  "`$c=[IO.File]::ReadAllText('$scriptPath',[Text.Encoding]::UTF8); " +
                  "& ([ScriptBlock]::Create(`$c))"
+        # -WindowStyle Hidden 必须给：三个启动器（.vbs / .bat / 自启 .cmd）都是
+        # 静默启动的（wscript sh.Run cmd,0 / start /min …），只有这里漏了，
+        # 于是「更新完成 → 重启」之后屏幕上会多出一个控制台黑窗挂在那里，
+        # 用户会以为程序出错。
+        # 不用 -NoNewWindow：那会让新进程继承/挂到当前控制台，反而更容易闪一下。
         Start-Process -FilePath 'powershell.exe' `
             -ArgumentList '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', $inner `
-            -WorkingDirectory $base | Out-Null
+            -WorkingDirectory $base -WindowStyle Hidden | Out-Null
         Write-Log 'restart: launched new instance'
         # 退出自己（Closed 处理器会保存设置、释放互斥体）
         try { $window.Close() } catch { }
@@ -3643,6 +3648,39 @@ Write-Log 'UI ready, entering message loop'
 # 安装、升级、以及之后每次启动：桌面上要有「启动桌宠」。
 # 没有快捷方式，或还是旧的空白图标时，后台补一张宠物图标。
 # 已经是 KunPet 图标的不动，避免每次启动都换一只。
+#
+# 顺手自愈启动器的行尾（.vbs/.bat/.cmd 必须是 CRLF）。
+# 为什么要自愈：更新是从 GitHub raw 逐文件取原始字节，raw 不做行尾转换
+# （.gitattributes 的 eol=crlf 只在 git checkout 时生效），所以**老版本的更新器**
+# 会把启动器写成 LF。修复只对「用新版更新器」的场景有效，而用户从旧版升上来的
+# 那一次一定是旧更新器执行的 —— 不在这里补一次，那个用户就永远停在 LF 上。
+# 幂等：已经是 CRLF 的文件一个字节都不写。
+# 注意 .bat/.vbs 是 cmd/wscript 直接执行的，脚本本身不会崩，但 LF 的 .bat 在
+# goto/label 等结构上会出错，且会让仓库的 CI 检查（启动器必须 CRLF）失真。
+try {
+    foreach ($ln in @('启动桌宠.vbs', '启动桌宠.bat', 'start-pet.vbs')) {
+        $lp = Join-Path $script:logDir $ln
+        if (-not (Test-Path -LiteralPath $lp)) { continue }
+        $lb = [IO.File]::ReadAllBytes($lp)
+        $loneLf = $false
+        for ($li = 0; $li -lt $lb.Length; $li++) {
+            if ($lb[$li] -eq 10 -and ($li -eq 0 -or $lb[$li - 1] -ne 13)) { $loneLf = $true; break }
+        }
+        if ($loneLf) {
+            $fixed = New-Object System.Collections.Generic.List[byte]
+            for ($li = 0; $li -lt $lb.Length; $li++) {
+                $by = $lb[$li]
+                if ($by -eq 10 -and ($li -eq 0 -or $lb[$li - 1] -ne 13)) { $fixed.Add([byte]13) }
+                $fixed.Add($by)
+            }
+            [IO.File]::WriteAllBytes($lp, $fixed.ToArray())
+            Write-Log ('launcher line endings repaired: ' + $ln)
+        }
+    }
+} catch {
+    Write-Log ('launcher line ending repair failed: ' + $_.Exception.Message)
+}
+
 try {
     if (Get-Command -Name 'Ensure-PetDesktopShortcut' -ErrorAction SilentlyContinue) {
         Ensure-PetDesktopShortcut -PetDir $script:logDir
