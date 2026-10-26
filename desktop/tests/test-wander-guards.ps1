@@ -43,10 +43,13 @@ CheckTrue '已暂停 → 不动（暂停的语义就是冻结小宠）' (-not (T
 $c = New-Ctx; $c.dragging = $true
 CheckTrue '用户正在拖拽 → 不动（否则和鼠标抢窗口）' (-not (Test-Allowed $c))
 
-# 悬停不再刹停：「鼠标停上去就冻住、得等它自己恢复」正是要消掉的割裂感。
-# 遗留的 hover 字段必须被忽略，否则老调用点会重新引入冻结。
+# 注意：v2.4.2 起「悬停 300ms 刹停走动」的逻辑被**刻意移除**——
+# 鼠标停在宠物身上时它整个停住、要等它自己恢复才能操作，很割裂。
+# 现在悬停**不**影响走动：想操作直接按住左键就能拖（mousedown 会接管）。
+# （旧测试在这里断言 hover=true 不许动，并测过 Get-HoverPauseState /
+#   Test-PointInRect；那两个函数已随功能一起删除，断言也已反转。）
 $c = New-Ctx; $c.hover = $true
-CheckTrue '鼠标悬停在宠物上 → 照样允许走动（不再冻结）' (Test-Allowed $c)
+CheckTrue '鼠标悬停 → 照常移动（v2.4.2 起悬停不再刹停，直接按住左键就能拖）' (Test-Allowed $c)
 
 $c = New-Ctx; $c.menuOpen = $true
 CheckTrue '右键/托盘菜单正开着 → 不动（否则菜单还没点完它就跑走）' (-not (Test-Allowed $c))

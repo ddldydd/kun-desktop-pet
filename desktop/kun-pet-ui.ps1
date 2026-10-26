@@ -36,3 +36,31 @@ function Resolve-BubbleText([string]$normalText, [string]$noticeText, $noticeUnt
     }
     return @{ bubble = $bubble; noticeText = $notice }
 }
+
+# 决定气泡**该不该显示**。
+#
+# 背景：没有任务时气泡以前永远挂着「怎么还不来找我~有事找我」——
+# 它不携带任何信息，还一直占着桌面。现在改为：只有「有话可说」时才显示，
+# 没话说时保留一小段宽限期（让状态切换有个过渡），然后整体收起
+# （含小尾巴），只留小宠本身。
+#
+# 「有话可说」由调用方判断（等待审批/提问、临时提示、任务进展、
+# 点击反应、出错都算）；这里只负责计时与翻转。
+#
+# 参数：
+#   $worth      这一帧是否有值得显示的内容
+#   $idleSince  上一次返回的 idleSince（$null = 之前一直有话说，还没开始计时）
+#   $now        当前时间
+#   $graceMs    没话说后还能再显示多少毫秒
+#
+# 返回 @{ visible; idleSince }：
+#   visible   = 这一帧气泡是否显示
+#   idleSince = 传回给下一帧的计时起点（有话说时清回 $null）
+function Resolve-BubbleVisibility([bool]$worth, $idleSince, $now, [int]$graceMs = 6000) {
+    if ($worth) { return @{ visible = $true; idleSince = $null } }
+    $since = $idleSince
+    if ($null -eq $since) { $since = $now }   # 刚进入「没话说」：从现在开始计时
+    $visible = $true
+    try { $visible = (($now - $since).TotalMilliseconds -lt $graceMs) } catch { $visible = $true }
+    return @{ visible = $visible; idleSince = $since }
+}

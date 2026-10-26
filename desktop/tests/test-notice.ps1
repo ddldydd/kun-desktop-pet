@@ -80,5 +80,46 @@ $r = Resolve-BubbleText '我先去干活啦！' '🔍 正在检查更新…' (Ge
 Check '刚置位的提示立刻就是气泡内容' $r.bubble '🔍 正在检查更新…'
 
 Write-Host ""
+Write-Host "=== 6. 气泡可见性：有话可说才显示，没话说过完宽限期收起 ===" -ForegroundColor Cyan
+# 守护一个真实反馈：没有任务时气泡永远挂着「怎么还不来找我~有事找我」，
+# 不携带任何信息还占桌面。现在没话说时只保留一段宽限期，之后整体收起。
+if (-not (Get-Command -Name 'Resolve-BubbleVisibility' -CommandType Function -ErrorAction SilentlyContinue)) {
+    Write-Host "Resolve-BubbleVisibility 未定义" -ForegroundColor Red; exit 1
+}
+$t0 = Get-Date
+
+# 有话说 → 立即显示，且清掉计时游标
+$v = Resolve-BubbleVisibility $true $t0.AddSeconds(-60) $t0 6000
+CheckTrue '有话说 → 显示' $v.visible
+Check '有话说 → idleSince 清回 $null' $v.idleSince $null
+
+# 刚进入没话说 → 宽限期内仍显示，并开始计时
+$v = Resolve-BubbleVisibility $false $null $t0 6000
+CheckTrue '刚没话说 → 宽限期内仍显示' $v.visible
+Check '刚没话说 → idleSince 从现在开始计时' ($v.idleSince -eq $t0) 'True'
+
+# 计时中（未到期）→ 仍显示，游标原样传回
+$v = Resolve-BubbleVisibility $false $t0.AddSeconds(-3) $t0 6000
+CheckTrue '计时 3s / 宽限 6s → 仍显示' $v.visible
+Check '计时中 → 游标原样传回' ($v.idleSince -eq $t0.AddSeconds(-3)) 'True'
+
+# 超过宽限期 → 收起
+$v = Resolve-BubbleVisibility $false $t0.AddSeconds(-6.5) $t0 6000
+Check '计时 6.5s / 宽限 6s → 收起' $v.visible 'False'
+Check '收起后游标保留（继续持有起点，一旦有话说再清）' ($v.idleSince -eq $t0.AddSeconds(-6.5)) 'True'
+
+# 收起后又有话说 → 立即恢复显示
+$v = Resolve-BubbleVisibility $true $t0.AddSeconds(-99) $t0 6000
+CheckTrue '收起后又有话说 → 立即恢复显示' $v.visible
+
+# 边界：坏输入不抛异常（动画定时器每帧都调它）
+$ok = $true
+try { $v = Resolve-BubbleVisibility $false 'not-a-date' $t0 6000 } catch { $ok = $false }
+CheckTrue '游标不是日期也不抛异常（按刚进入计）' $ok
+$ok = $true
+try { $v = Resolve-BubbleVisibility $false $null $null 6000 } catch { $ok = $false }
+CheckTrue '$null 时间不抛异常' $ok
+
+Write-Host ""
 if ($script:fail -eq 0) { Write-Host ("全部通过：{0} 项" -f $script:pass) -ForegroundColor Green; exit 0 }
 else { Write-Host ("失败 {0} 项 / 通过 {1} 项" -f $script:fail, $script:pass) -ForegroundColor Red; exit 1 }
