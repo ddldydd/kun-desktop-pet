@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.3'
+    Version     = '2.4.4'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -1191,15 +1191,27 @@ function Get-PetVersion {
     return $script:cachedPetVersion
 }
 
+# 【v2.4.4 性能】会话投影缓存扫描节流：Get-ChildItem 160 文件 + 排序 + 活跃文件冷读
+# ConvertFrom-Json 都在 UI 线程。缓存由 DSH 秒级重写，1 秒节流对气泡无可感知影响。
+$script:harnessScanCache = $null
+$script:harnessScanCacheAt = [datetime]::MinValue
+$script:harnessScanIntervalMs = 1000
+
 Function Get-StateFromHarness {
     try {
+        # 节流窗口内直接复用上一次扫描结果（含 $null），避免每 500ms 全量列目录
+        $now = Get-Date
+        if (($now - $script:harnessScanCacheAt).TotalMilliseconds -lt $script:harnessScanIntervalMs) {
+            return $script:harnessScanCache
+        }
+        $script:harnessScanCacheAt = $now
         $files = $null
         try {
             $files = Get-ChildItem -Path $Config.ProjCacheDir -Filter *.json -File -ErrorAction Stop
-        } catch { return $null }
-        if ($null -eq $files) { return $null }
+        } catch { $script:harnessScanCache = $null; return $null }
+        if ($null -eq $files) { $script:harnessScanCache = $null; return $null }
         $arr = @($files | Sort-Object LastWriteTime -Descending)
-        if ($arr.Count -eq 0) { return $null }
+        if ($arr.Count -eq 0) { $script:harnessScanCache = $null; return $null }
         $now = Get-Date
         $nowMs = Get-EpochMs
 
@@ -1211,7 +1223,7 @@ Function Get-StateFromHarness {
             if ($fAgeSec -le 900 -or $tracked) { $candidates += $f }
             if ($candidates.Count -ge 24) { break }
         }
-        if ($candidates.Count -eq 0) { return $null }
+        if ($candidates.Count -eq 0) { $script:harnessScanCache = $null; return $null }
         $script:docCacheMark = @{}
 
         $workingSessions = @()
@@ -1596,18 +1608,58 @@ function Convert-DshSnapshot($resp, [string]$source) {
     }
 }
 
-function Get-StateFromDshHttp {
+# 【v2.4.4 性能】HTTP 通道整体挪到后台 runspace。
+# 背景（实测）：Invoke-RestMethod 每次调用都要新建连接（PS 5.1 无连接复用），
+# 端点响应稍慢（>50ms）UI 线程就顿一下；端点不在时第一次要白等满超时（原 2 秒），
+# 表现就是「宠物动着动着停一下，像卡住了」。现在：UI 线程只读缓存快照，
+# 真正的 HTTP 跑在 Start-BgOp 的后台 runspace 里，完成后把结果交回 UI 线程。
+$script:dshHttpSnap = $null            # 后台拉到的最新快照（UI 线程只读）
+$script:dshHttpRefreshAt = [datetime]::MinValue   # 上次发起后台刷新的时刻
+$script:dshHttpInFlight = $false       # 防止上一轮还没回来又派新一轮
+$script:dshHttpIntervalMs = 2000       # 后台刷新节流：插件端点 1 秒内多次变化也只 2 秒一拉
+
+# 后台执行体：自包含（不引用主脚本的任何函数/变量 —— runspace 是空的）。
+# 参数：$url。返回： @{ ok; resp; error }（resp 已是 PSCustomObject）。
+$script:dshHttpFetchBody = {
+    param([string]$url)
     try {
-        # 插件端点不可用时退避几秒，避免每个轮询都白等超时
-        if ((Get-Date) -lt $script:dshBackoffUntil) { return $null }
-        $url = Resolve-EndpointUrl
-        $resp = Invoke-RestMethod -Uri $url -TimeoutSec 2 -ErrorAction Stop
-        $script:dshBackoffUntil = [datetime]::MinValue
-        return (Convert-DshSnapshot $resp 'dsh')
+        $resp = Invoke-RestMethod -Uri $url -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        return @{ ok = $true; resp = $resp; error = '' }
     } catch {
-        $script:dshBackoffUntil = (Get-Date).AddSeconds(3)
+        return @{ ok = $false; resp = $null; error = $_.Exception.Message }
     }
-    return $null
+}
+
+# UI 侧入口：节流地派后台任务；结果由 bgOps 收尾回调写进 $script:dshHttpSnap。
+function Start-DshHttpRefresh {
+    if ($script:dshHttpInFlight) { return }
+    $now = Get-Date
+    if (($now - $script:dshHttpRefreshAt).TotalMilliseconds -lt $script:dshHttpIntervalMs) { return }
+    # 端点退避期间不派任务（退避逻辑保留：端点不在时别白白打网络）
+    if ($now -lt $script:dshBackoffUntil) { return }
+    $url = Resolve-EndpointUrl
+    if (-not $url) { return }
+    $script:dshHttpRefreshAt = $now
+    $script:dshHttpInFlight = $true
+    Start-BgOp $script:dshHttpFetchBody @($url) {
+        param($result, $errText)
+        $script:dshHttpInFlight = $false
+        if ($null -ne $result -and $result.ok) {
+            $script:dshBackoffUntil = [datetime]::MinValue
+            $script:dshHttpSnap = (Convert-DshSnapshot $result.resp 'dsh')
+        } else {
+            # 失败：清快照 + 退避。旧行为是同步等满 2 秒超时才知道不在；
+            # 现在失败不冻 UI，退避可以更短一点，恢复更快。
+            $script:dshHttpSnap = $null
+            $script:dshBackoffUntil = (Get-Date).AddSeconds(3)
+            if ($errText) { Write-Log ('dsh http: ' + $errText) }
+        }
+    } 'dsh-http'
+}
+
+function Get-StateFromDshHttp {
+    # 只返回后台已拉到的缓存快照；刷新由 Start-DshHttpRefresh 触发（UI 线程零网络 I/O）
+    return $script:dshHttpSnap
 }
 
 # 文件通道：只在快照还新鲜时采信（插件每次状态变化都会重写它；
@@ -1635,6 +1687,8 @@ function Get-StateFromDshFile {
 }
 
 function Get-StateFromDsh {
+    # 先确保后台刷新在跑（节流 2s 一次，UI 线程零阻塞），再用缓存快照
+    Start-DshHttpRefresh
     $snap = Get-StateFromDshHttp
     if ($null -ne $snap) { return $snap }
     return (Get-StateFromDshFile)
@@ -2996,11 +3050,12 @@ $pollTimer.Add_Tick({
                 $script:dragStuckTicks = 0
             } elseif ([bool]$state.dragging -or $null -ne $script:dragStart) {
                 $script:dragStuckTicks++
-                if ($script:dragStuckTicks -ge 3) {
+                if ($script:dragStuckTicks -ge 2) {
                     $script:dragStuckTicks = 0
                     Write-Log ('watchdog: cleared stuck drag state (dragging={0}, dragStart={1})' -f [bool]$state.dragging, ($null -ne $script:dragStart))
                     $script:dragStart = $null
                     $state.dragging = $false
+                    try { $window.ReleaseMouseCapture() } catch { }
                 }
             } else {
                 $script:dragStuckTicks = 0
@@ -3012,7 +3067,7 @@ $pollTimer.Add_Tick({
                     $script:menuStuckTicks = 0
                 } else {
                     $script:menuStuckTicks++
-                    if ($script:menuStuckTicks -ge 3) {
+                    if ($script:menuStuckTicks -ge 2) {
                         $script:menuStuckTicks = 0
                         Write-Log 'watchdog: cleared stuck menuOpen (menu not visible)'
                         $state.menuOpen = $false
@@ -3578,6 +3633,27 @@ $btnRejectEl.Add_Click({ Send-ApprovalDecision 'rejected' })
 $window.Add_MouseLeftButtonDown({
     param($sender, $eventArgs)
     try {
+        # 【v2.4.4 可拖性】按下即接管：先做一次状态自检，把任何残留的交互状态
+        # 当场清掉 —— 看门狗要等 1.5 秒才复位，用户这一下点击不该等它。
+        # 覆盖三种残留：拖拽状态、菜单状态、鼠标捕获。清完再走正常拖拽链路，
+        # 无论之前处于什么卡住形态，「这一下按住就能拖」。
+        try {
+            $lbNowPressed = ([System.Windows.Input.Mouse]::LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed)
+            if ($lbNowPressed) {
+                if ([bool]$state.dragging -or ($null -ne $script:dragStart -and -not [bool]$script:dragStart.moved)) {
+                    # 上一次拖拽状态残留（MouseUp 被吞）：清掉重来
+                    $script:dragStart = $null
+                    $state.dragging = $false
+                    Write-Log 'mousedown: cleared stale drag state'
+                }
+                $menuReallyOpen = $true
+                try { $menuReallyOpen = [bool]$menu.Visible } catch { $menuReallyOpen = $true }
+                if ([bool]$state.menuOpen -and -not $menuReallyOpen) {
+                    $state.menuOpen = $false
+                    Write-Log 'mousedown: cleared stale menuOpen'
+                }
+            }
+        } catch { }
         # 不用 DragMove()：它是模态循环，拖动期间收不到 MouseMove，方向动画无法更新
         $relPoint = [System.Windows.Input.Mouse]::GetPosition($window)
         $screenPoint = $window.PointToScreen($relPoint)
