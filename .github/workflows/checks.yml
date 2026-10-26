@@ -270,6 +270,39 @@ jobs:
           }
           Write-Host ("版本号一致：$vj")
 
+      - name: 内嵌备用脚本与源文件一致（ensure-pet-shortcut.ps1 ↔ base64）
+        shell: pwsh
+        run: |
+          # kun-pet-update.ps1 里内嵌了一段 petShortcutFallbackB64，是老版本就地升级、
+          # 且 make-shortcut.ps1 还没被更新下来时的兜底（用来画快捷方式图标）。
+          # 它的源文件是 desktop/ensure-pet-shortcut.ps1。两者一旦漂移，兜底路径会
+          # 悄悄失效（快捷方式建不出来 / 图标不对），而且只在老版本升级场景才暴露，
+          # 平时根本测不到。这里用与运行时完全相同的规范化口径做字节级比对：
+          #   去 BOM -> 统一 LF -> UTF-8 编码 -> Base64。
+          # 注意：仓库 checkout 出的 .ps1 是 LF，本地 Windows checkout 会是 CRLF，
+          # 所以必须规范化后才能比对，不能直接比 raw bytes。
+          $src = './desktop/ensure-pet-shortcut.ps1'
+          if (-not (Test-Path $src)) {
+            Write-Host "::error::缺少 desktop/ensure-pet-shortcut.ps1（内嵌备用脚本的源文件）"
+            exit 1
+          }
+          $bytes = [IO.File]::ReadAllBytes($src)
+          $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+          if ($hasBom) { $bytes = $bytes[3..($bytes.Length - 1)] }
+          $text = [Text.Encoding]::UTF8.GetString($bytes).Replace("`r`n", "`n").Replace("`r", "`n")
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text))
+          $upd = Get-Content ./desktop/kun-pet-update.ps1 -Raw
+          $m = [regex]::Match($upd, "petShortcutFallbackB64 = '([A-Za-z0-9+/=]+)'")
+          if (-not $m.Success) {
+            Write-Host "::error::kun-pet-update.ps1 里找不到 petShortcutFallbackB64"
+            exit 1
+          }
+          if ($m.Groups[1].Value -ne $b64) {
+            Write-Host "::error::内嵌 base64 与 ensure-pet-shortcut.ps1 不一致（改了源文件要重新生成 base64）"
+            exit 1
+          }
+          Write-Host "内嵌备用脚本与源文件一致"
+
       - name: 安装检查依赖
         run: python3 -m pip install --quiet --disable-pip-version-check Pillow
 
