@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.4'
+    Version     = '2.4.5'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -595,9 +595,13 @@ $state = [hashtable]::Synchronized(@{
     piProvider          = ''
     # 本帧的源标记：'dsh' / 'pi' / 'dsh+pi'，气泡底部据此显示
     agentSource         = 'dsh'
+    # 动作速度：0.5 慢 / 1 正常 / 2 快 / 'still' 完全静止（帧与浮动都冻结，气泡照常）
+    animSpeed           = 1.0
     # pi 源通道变化（'ext'=扩展状态文件 / 'sessions'=会话尾随 / $null=未生效）打一行日志
     piChannel           = 'init'
     lastApprovalAlertId = $null
+    # 真实数据源最后一次给出快照的时刻（兜底源粘性用，v2.4.5）
+    lastRealSourceAt = Get-Date
     alertFlashUntil = [datetime]::MinValue
     taskText = ''
     questionText = ''
@@ -1614,6 +1618,7 @@ function Convert-DshSnapshot($resp, [string]$source) {
 # 表现就是「宠物动着动着停一下，像卡住了」。现在：UI 线程只读缓存快照，
 # 真正的 HTTP 跑在 Start-BgOp 的后台 runspace 里，完成后把结果交回 UI 线程。
 $script:dshHttpSnap = $null            # 后台拉到的最新快照（UI 线程只读）
+$script:dshHttpSnapAt = [datetime]::MinValue      # 快照成功获取的时刻（新鲜度判断）
 $script:dshHttpRefreshAt = [datetime]::MinValue   # 上次发起后台刷新的时刻
 $script:dshHttpInFlight = $false       # 防止上一轮还没回来又派新一轮
 $script:dshHttpIntervalMs = 2000       # 后台刷新节流：插件端点 1 秒内多次变化也只 2 秒一拉
@@ -1647,10 +1652,12 @@ function Start-DshHttpRefresh {
         if ($null -ne $result -and $result.ok) {
             $script:dshBackoffUntil = [datetime]::MinValue
             $script:dshHttpSnap = (Convert-DshSnapshot $result.resp 'dsh')
+            $script:dshHttpSnapAt = Get-Date
         } else {
-            # 失败：清快照 + 退避。旧行为是同步等满 2 秒超时才知道不在；
-            # 现在失败不冻 UI，退避可以更短一点，恢复更快。
-            $script:dshHttpSnap = $null
+            # 失败：**不清空旧快照**（保留上一次成功的数据继续显示）+ 退避重试。
+            # 【v2.4.5 修闪】清空会让来源标签在「Harness 实时 ↔ 会话活跃度（兜底）」之间
+            # 翻转，气泡文字跟着变，SizeToContent 窗口每几秒重排 = 用户看到的一闪一闪。
+            # 旧快照超过 15 秒仍没成功才真正弃用（Get-StateFromDshHttp 里按时间判断）。
             $script:dshBackoffUntil = (Get-Date).AddSeconds(3)
             if ($errText) { Write-Log ('dsh http: ' + $errText) }
         }
@@ -1658,7 +1665,13 @@ function Start-DshHttpRefresh {
 }
 
 function Get-StateFromDshHttp {
-    # 只返回后台已拉到的缓存快照；刷新由 Start-DshHttpRefresh 触发（UI 线程零网络 I/O）
+    # 只返回后台已拉到的缓存快照；刷新由 Start-DshHttpRefresh 触发（UI 线程零网络 I/O）。
+    # 快照超过 15 秒没刷新视为失效（插件真的退出了），否则一直沿用旧值 ——
+    # 短暂失败时显示略旧的状态远好过标签来回翻转（那才是用户看得见的 bug）。
+    if ($null -ne $script:dshHttpSnap) {
+        $ageMs = ((Get-Date) - $script:dshHttpSnapAt).TotalMilliseconds
+        if ($ageMs -gt 15000) { $script:dshHttpSnap = $null }
+    }
     return $script:dshHttpSnap
 }
 
@@ -1839,6 +1852,7 @@ function Save-Settings {
             piEnabled = [bool]$state.piEnabled
             # 随机移动：默认关，同样用「字段是否存在」判断（见 Load-Settings）
             wander = [bool]$state.wanderEnabled
+            animSpeed = $state.animSpeed
             posLeft = [double]$window.Left
             posTop  = [double]$window.Top
             # 窗口是 SizeToContent：尺寸随气泡文字变，只存左上角的话，
@@ -1923,6 +1937,17 @@ function Load-Settings {
         # 默认关；只有明确存了 true 才开。
         if ($null -ne $saved.wander) {
             $state.wanderEnabled = [bool]$saved.wander
+        }
+        # 动作速度：数字倍率或 'still'；非法值保持默认 1.0
+        if ($null -ne $saved.animSpeed) {
+            $as = $saved.animSpeed
+            if ($as -eq 'still') { $state.animSpeed = 'still' }
+            else {
+                $asn = 0.0
+                if ([double]::TryParse([string]$as, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$asn)) {
+                    if ($asn -ge 0.25 -and $asn -le 4) { $state.animSpeed = $asn }
+                }
+            }
         }
         if ($null -ne $saved.posLeft -and $null -ne $saved.posTop) {
             try {
@@ -2422,6 +2447,43 @@ $miFloat.add_Click({
     Save-Settings
 })
 $menu.Items.Add($miFloat) | Out-Null
+
+# 【v2.4.5】动作速度：慢 / 正常 / 快 / 完全静止（最慢 = 不动，帧与浮动都冻结，气泡照常）。
+# 动作太快容易拉走注意力，所以速度可调；「完全静止」给想要绝对安静的用户。
+$speedMenu = [System.Windows.Forms.ToolStripMenuItem]::new('动作速度')
+$script:speedItems = @()
+$script:speedPresets = @(
+    @{ label = '慢';      value = 0.5 },
+    @{ label = '正常';    value = 1.0 },
+    @{ label = '快';      value = 2.0 },
+    @{ label = '完全静止'; value = 'still' }
+)
+foreach ($preset in $script:speedPresets) {
+    $item = [System.Windows.Forms.ToolStripMenuItem]::new([string]$preset.label)
+    $item.Tag = $preset.value
+    $item.add_Click({
+        param($sender, $eventArgs)
+        $state.animSpeed = $sender.Tag
+        if ($state.animSpeed -eq 'still') {
+            # 立即静止：浮动归零，停在当前帧
+            $floatTransform.Y = 0
+            $floatTransform.X = 0
+        }
+        Update-SpeedMenuChecks
+        Save-Settings
+    })
+    $script:speedItems += $item
+    $speedMenu.DropDownItems.Add($item) | Out-Null
+}
+$menu.Items.Add($speedMenu) | Out-Null
+
+function Update-SpeedMenuChecks {
+    try {
+        foreach ($item in $script:speedItems) {
+            $item.Checked = ([string]$state.animSpeed -eq [string]$item.Tag)
+        }
+    } catch { }
+}
 
 # 随机移动（到处跑）开关。默认关：宠物自己会动是有打扰性的，必须用户主动开。
 # 关掉的那一刻如果正走在半路，会把目标清掉，让它立刻停在原地。
@@ -3020,6 +3082,7 @@ if ($script:piModuleLoaded) { Set-PiEnabled $state.piEnabled }
 Write-Log ('pi compatibility: ' + $(if ($state.piEnabled) { 'enabled' } else { 'disabled' }))
 # 随机移动开关的勾选同样要跟着设置走
 $miWander.Checked = [bool]$state.wanderEnabled
+Update-SpeedMenuChecks
 Write-Log ('wander: ' + $(if ($state.wanderEnabled) { 'enabled' } else { 'disabled' }) + $(if (-not $script:wanderModuleLoaded) { ' (module missing!)' } else { '' }))
 # 版本与更新模块状态：排查「检查更新点了没反应」时先看这两行
 Write-Log ('version: ' + (Get-PetVersion) + ' · update module: ' + $(if ($script:updateModuleLoaded) { 'loaded' } else { 'MISSING' }) + ' · source: ' + (Get-UpdateSource))
@@ -3242,10 +3305,28 @@ $pollTimer.Add_Tick({
             $state.agentSource = 'dsh'
         }
 
-        if ($null -eq $snap) {
-            $snap = Get-StateFromSessions
-            if ($null -eq $snap) { $snap = @{ mode = 'disconnected'; source = 'none' } }
+        # 【v2.4.5 修闪】兜底源粘性：真实源（harness/dsh）偶尔空一轮不代表 DSH 真没了 ——
+        # 节流窗口、后台 HTTP 在途都会造成单轮空快照。立刻掉到「会话活跃度（兜底）」
+        # 会让底部标签与气泡文字翻转（SizeToContent 每次重排 = 一闪一闪）。
+        # 现在连续 6 秒（12 轮）拿不到真实快照才降级；期间沿用上一帧的真实源与状态。
+        $realSource = $false
+        if ($null -ne $snap) { $realSource = $true }
+        elseif ($state.lastSource -eq 'harness' -or $state.lastSource -eq 'dsh' -or $state.lastSource -eq 'dsh-file' -or $state.lastSource -eq 'pi') {
+            $script:lastRealSourceAt = Get-Date
+            # 无新快照：沿用上一帧的 mode（不重置 modeStart，"已 Ns" 不跳）
+            $snap = $null
         }
+        if ($null -eq $snap) {
+            $sinceReal = ((Get-Date) - $script:lastRealSourceAt).TotalSeconds
+            if ($sinceReal -lt 6) {
+                # 6 秒内：粘住上一帧。没有进展文字（避免复述旧任务），但 mode/标签都不变
+                $snap = @{ mode = $state.mode; source = $state.lastSource; seq = $state.seq }
+            } else {
+                $snap = Get-StateFromSessions
+                if ($null -eq $snap) { $snap = @{ mode = 'disconnected'; source = 'none' } }
+            }
+        }
+        if ($realSource) { $script:lastRealSourceAt = Get-Date }
         $state.lastSource = $snap.source
         Update-ApprovalPanel $dshSnap
         # 记下气泡要用的等待信息（权限 / 提问都记）：动画定时器据此渲染醒目气泡
@@ -3397,13 +3478,23 @@ $animTimer.Add_Tick({
         # 暂停 = 只冻结小宠本身：不推进帧、不做浮动/缩放、不重画形象。
         # 下面的气泡/进度/等待提示一律照常刷新（这是暂停时唯一还在动的东西）。
         if (-not $pausedNow) {
-        $script:phase += 0.09
+        # 浮动相位随速度缩放：慢速时呼吸/浮动也放慢；still 时相位不动（完全静止）
+        if ($state.animSpeed -eq 'still') {
+            # 相位不推进
+        } else {
+            $script:phase += 0.09 * [double]$state.animSpeed
+        }
 
         # 帧推进
         $anim = $ActionAnimMap[$action]
         if (-not $anim) { $anim = $ActionAnimMap['idle'] }
         $now = Get-Date
-        if (($now - $state.frameAt).TotalMilliseconds -ge [double]$anim.fps) {
+        # 【v2.4.5】动作速度：$state.animSpeed = 0.5（慢）/ 1（正常）/ 2（快）/ 'still'（完全静止）。
+        # still 时不推进帧也不浮动 —— 帧冻结但气泡照常（用户要求「最慢就是不动」）。
+        if ($state.animSpeed -eq 'still') {
+            # 完全静止：不推进帧。frameAt 持续刷新，恢复速度后从当前帧平滑继续。
+            $state.frameAt = $now
+        } elseif (($now - $state.frameAt).TotalMilliseconds -ge ([double]$anim.fps / [double]$state.animSpeed)) {
             $state.frame = $state.frame + 1
             $state.frameAt = $now
         }
@@ -3419,7 +3510,7 @@ $animTimer.Add_Tick({
         $floatX = 0.0
         $floatY = 0.0
         # 拖着走的时候不要再做窗口内浮动：分层窗每帧重绘会跟 SetWindowPos 抢，更卡
-        if ($state.floating -and -not $state.dragging) {
+        if ($state.floating -and -not $state.dragging -and $state.animSpeed -ne 'still') {
             $floatY = [math]::Sin($script:phase) * $amp
             if ($wobble -gt 0) { $floatX = [math]::Sin($script:phase * 2.4) * $wobble }
         }
@@ -3603,7 +3694,10 @@ $animTimer.Add_Tick({
         # 版本号放在底部：用户能一眼看到自己跑的是哪一版（排查/确认更新是否生效都靠它）
         $verLabel = ' · v' + (Get-PetVersion)
         # 进展显示在气泡里；底部只保留来源/版本/模型/时长等辅助信息（仅变化时写，减少布局）
-        $hintValue = '{0}{1}{2}{3} · 已 {4}s' -f $sourceLabel, $verLabel, $piLabel, $pauseLabel, $elapsedSec
+        # 【v2.4.5 修闪】时长改分钟粒度：秒级变化让 SizeToContent 每秒重排一次，
+        # 底部提示看起来在一闪一闪。分钟粒度下一分钟才变一次文字。
+        $elapsedLabel = if ($elapsedSec -lt 60) { '刚刚' } else { '已 {0} 分' -f [int][math]::Floor($elapsedSec / 60) }
+        $hintValue = '{0}{1}{2}{3} · {4}' -f $sourceLabel, $verLabel, $piLabel, $pauseLabel, $elapsedLabel
         if ($hintTextEl.Text -ne $hintValue) { $hintTextEl.Text = $hintValue }
     } catch { Note-TickError 'anim' $_ }
 })
