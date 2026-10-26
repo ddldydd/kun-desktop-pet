@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.5'
+    Version     = '2.4.6'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -600,8 +600,7 @@ $state = [hashtable]::Synchronized(@{
     # pi 源通道变化（'ext'=扩展状态文件 / 'sessions'=会话尾随 / $null=未生效）打一行日志
     piChannel           = 'init'
     lastApprovalAlertId = $null
-    # 真实数据源最后一次给出快照的时刻（兜底源粘性用，v2.4.5）
-    lastRealSourceAt = Get-Date
+    # （v2.4.6：粘性游标改用 $script: 变量，见 Get-StateFromDsh 之后的轮询合并段）
     alertFlashUntil = [datetime]::MinValue
     taskText = ''
     questionText = ''
@@ -1200,6 +1199,10 @@ function Get-PetVersion {
 $script:harnessScanCache = $null
 $script:harnessScanCacheAt = [datetime]::MinValue
 $script:harnessScanIntervalMs = 1000
+# 真实数据源粘性游标（v2.4.6）：最后一次真实快照的时刻与快照本体。
+# 用 $script: 而不是 $state 字段：轮询回调里赋值要落在脚本作用域，$state 只是哈希表。
+$script:lastRealSourceAt = Get-Date
+$script:lastRealSnap = $null
 
 Function Get-StateFromHarness {
     try {
@@ -1539,7 +1542,11 @@ Function Get-StateFromHarness {
         elseif ($mode -eq 'review') { $modeWeight = 4 }
         $seqFingerprint = [int](($totalTurns * 100000) + ($totalSteps * 10) + ($workingSessions.Count * 6) + ($waitingSessions.Count * 3) + $modeWeight)
 
-        return @{
+        # 【v2.4.6 修闪】成功结果必须写节流缓存：v2.4.4 只在三个空出口写了，
+        # 成功出口漏写 —— 节流窗口内返回 $null，外层粘性逻辑只好合成缺 progressLines
+        # 的瘦快照，气泡第二行被改写成「进行中…」，下一轮真扫描又写回详情行，
+        # 如此每 500ms 翻一次 = 用户看到的一闪一闪。
+        $result = @{
             mode           = $mode
             seq            = $seqFingerprint
             source         = 'harness'
@@ -1565,6 +1572,8 @@ Function Get-StateFromHarness {
             detail         = $detail
             progressLines  = $progressLines
         }
+        $script:harnessScanCache = $result
+        return $result
     } catch {
         Note-TickError 'harness-state' $_
         return $null
@@ -3305,28 +3314,27 @@ $pollTimer.Add_Tick({
             $state.agentSource = 'dsh'
         }
 
-        # 【v2.4.5 修闪】兜底源粘性：真实源（harness/dsh）偶尔空一轮不代表 DSH 真没了 ——
-        # 节流窗口、后台 HTTP 在途都会造成单轮空快照。立刻掉到「会话活跃度（兜底）」
-        # 会让底部标签与气泡文字翻转（SizeToContent 每次重排 = 一闪一闪）。
-        # 现在连续 6 秒（12 轮）拿不到真实快照才降级；期间沿用上一帧的真实源与状态。
-        $realSource = $false
-        if ($null -ne $snap) { $realSource = $true }
-        elseif ($state.lastSource -eq 'harness' -or $state.lastSource -eq 'dsh' -or $state.lastSource -eq 'dsh-file' -or $state.lastSource -eq 'pi') {
+        # 【v2.4.6 修闪·重写】真实源偶尔空一轮（节流窗口 / 后台 HTTP 在途）不代表 DSH 没了。
+        # v2.4.5 的实现有两个 bug，正是它们造成「进行中… ↔ 正在处理：…」每 500ms 翻转：
+        #   a) 粘住时合成只有 mode/source/seq 的瘦快照 —— 缺 progressLines/detail/taskText，
+        #      Update-Alerts 把 taskLines 改写成「进行中…」，下一轮真扫描又写回详情行；
+        #   b) 空快照时先把 lastRealSourceAt 刷新成当前时刻，再算 sinceReal —— 永远 ≈ 0，
+        #      粘性窗口永不过期，真实源真消失后 mode 也永久粘住旧值（脏文字残留）。
+        # 正确做法：只在**拿到真实快照**时刷新 lastRealSourceAt；粘住时**原样复用上一帧
+        # 的完整快照**（progressLines 等字段齐全，taskLines 内容不变，气泡不闪）。
+        if ($null -ne $snap) {
             $script:lastRealSourceAt = Get-Date
-            # 无新快照：沿用上一帧的 mode（不重置 modeStart，"已 Ns" 不跳）
-            $snap = $null
-        }
-        if ($null -eq $snap) {
+            $script:lastRealSnap = $snap
+        } else {
             $sinceReal = ((Get-Date) - $script:lastRealSourceAt).TotalSeconds
-            if ($sinceReal -lt 6) {
-                # 6 秒内：粘住上一帧。没有进展文字（避免复述旧任务），但 mode/标签都不变
-                $snap = @{ mode = $state.mode; source = $state.lastSource; seq = $state.seq }
+            if ($sinceReal -lt 6 -and $null -ne $script:lastRealSnap) {
+                # 6 秒内：原样复用上一帧完整快照（无新信息但显示稳定）
+                $snap = $script:lastRealSnap
             } else {
                 $snap = Get-StateFromSessions
                 if ($null -eq $snap) { $snap = @{ mode = 'disconnected'; source = 'none' } }
             }
         }
-        if ($realSource) { $script:lastRealSourceAt = Get-Date }
         $state.lastSource = $snap.source
         Update-ApprovalPanel $dshSnap
         # 记下气泡要用的等待信息（权限 / 提问都记）：动画定时器据此渲染醒目气泡
@@ -3594,7 +3602,18 @@ $animTimer.Add_Tick({
                 elseif ($state.progressText) { $waitLines += (Limit-Text ([string]$state.progressText) 44) }
                 if ([string]$state.questionDetail) { $waitLines += ('说明：' + (Limit-Text ([string]$state.questionDetail) 36)) }
                 for ($oi = 0; $oi -lt [math]::Min(4, $opts.Count); $oi++) {
-                    $waitLines += ('{0}) {1}' -f ($oi + 1), [string]$opts[$oi])
+                    # 【v2.4.6】选项元素可能是对象而非字符串（不同插件版本的 ask_user_question
+                    # 载荷有差异），直接字符串化会把类型名/碎片拼进气泡（用户截图里
+                    # 的「· 1】】」脏文字）。取 label 类字段；取不到就丢弃，绝不让碎片上屏。
+                    $ov = $opts[$oi]
+                    $olabel = $null
+                    if ($ov -is [string]) { $olabel = $ov }
+                    else {
+                        foreach ($f in @('label', 'text', 'title', 'value', 'name')) {
+                            try { if ($ov.$f) { $olabel = [string]$ov.$f; break } } catch { }
+                        }
+                    }
+                    if ($olabel) { $waitLines += ('{0}) {1}' -f ($oi + 1), (Limit-Text $olabel 40)) }
                 }
                 if ($opts.Count -gt 4) { $waitLines += ('… 共 {0} 个选项' -f $opts.Count) }
                 if ($opts.Count -eq 0) { $waitLines += '切回 Harness 窗口作答' }
