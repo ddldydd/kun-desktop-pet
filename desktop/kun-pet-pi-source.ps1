@@ -998,11 +998,40 @@ function Get-StateFromPiExtension {
 # 优先级：扩展（精确，能表达「等你确认」）> 会话尾随（零安装，覆盖进展/收尾/出错）。
 # 两者都新鲜时，用扩展决定 mode/waiting，用会话补齐 model/turns/steps
 # （扩展不一定知道这些，会话文件里一定有）。
+# 【v2.4.4 性能】会话尾随通道节流：GetFiles(AllDirectories) 递归扫描 + 候选文件 tail
+# 256KB 读 + 逐行 ConvertFrom-Json，全部跑在 UI 线程（DispatcherTimer 回调）。
+# 实测：24 个候选的最坏情况要几百毫秒 —— 这就是「宠物动着动着停一下」的另一半来源。
+# 会话状态本身是秒级变化的，2 秒节流对气泡没有任何可感知影响；扩展状态文件通道很便宜，
+# 保持每轮（它才是「等你确认」的权威信号）。
+$script:piSesCache = $null
+$script:piSesCacheAt = [datetime]::MinValue
+$script:piSesCacheEmpty = $false
+$script:piSesIntervalMs = 2000
+
+# 测试钩子：夹具文件被改写后清掉节流缓存，让下一次调用立即重扫。
+# 真实运行不需要它（真实会话文件由 pi 追加写，mtime 变化本来就落在下个节流窗口里）。
+function Set-PiSessionCacheStale {
+    $script:piSesCache = $null
+    $script:piSesCacheAt = [datetime]::MinValue
+}
+
+function Get-StateFromPiSessionsThrottled {
+    $now = Get-Date
+    if (($now - $script:piSesCacheAt).TotalMilliseconds -lt $script:piSesIntervalMs) {
+        # 窗口内：直接用上一次结果（空/非空都缓存，避免每 500ms 白扫目录）
+        return $script:piSesCache
+    }
+    $script:piSesCacheAt = $now
+    $ses = Get-StateFromPiSessions
+    $script:piSesCache = $ses
+    return $ses
+}
+
 function Get-StateFromPi {
     if (-not $script:piEnabled) { return $null }
     try {
         $ext = Get-StateFromPiExtension
-        $ses = Get-StateFromPiSessions
+        $ses = Get-StateFromPiSessionsThrottled
 
         if ($null -eq $ext -and $null -eq $ses) { return $null }
         if ($null -eq $ext) { return $ses }

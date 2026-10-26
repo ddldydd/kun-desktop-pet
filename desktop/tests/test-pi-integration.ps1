@@ -66,6 +66,7 @@ try {
     $f = Join-Path $tmp 'a.jsonl'
     Copy-Item -LiteralPath (Join-Path $fixtures 'pi-running.jsonl') -Destination $f -Force
     (Get-Item -LiteralPath $f).LastWriteTime = (Get-Date).AddSeconds(-4)
+    Set-PiSessionCacheStale   # 节流缓存失效：夹具刚改过，强制下一轮重扫
 
     $piSnap = Get-StateFromPi
     CheckTrue 'pi 源给出快照' ($null -ne $piSnap)
@@ -184,6 +185,7 @@ try {
         Set-Content -LiteralPath $p -Value $src -Encoding UTF8
         (Get-Item -LiteralPath $p).LastWriteTime = (Get-Date).AddSeconds(-5)
     }
+    Set-PiSessionCacheStale
     $snapW = Get-StateFromPi
     CheckTrue '多窗口：拿到快照' ($null -ne $snapW)
     Check '多窗口：4 个窗口 = 4 个任务' $snapW.runningAgents 4
@@ -199,6 +201,7 @@ try {
     New-Item -ItemType Directory -Force -Path $artDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $fixtures 'pi-running.jsonl') -Destination (Join-Path $artDir 'run_worker.jsonl') -Force
     (Get-Item -LiteralPath (Join-Path $artDir 'run_worker.jsonl')).LastWriteTime = (Get-Date).AddSeconds(-3)
+    Set-PiSessionCacheStale
     $snapSub = Get-StateFromPi
     Check '子代理产物不计入任务数（仍为 4）' $snapSub.runningAgents 4
     CheckTrue '日志记录了跳过的嵌套会话' ((@($script:logLines) -join "`n") -match 'subagent artifact|skipped nested')
