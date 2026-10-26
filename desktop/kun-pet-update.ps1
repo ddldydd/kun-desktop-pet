@@ -43,6 +43,7 @@ if (-not $script:updAllowedFiles) {
         '启动桌宠.vbs',
         '启动桌宠.bat',
         'start-pet.vbs',
+        'ensure-pet-shortcut.ps1',
         'make-shortcut.ps1',
         'make-icon.ps1'
     )

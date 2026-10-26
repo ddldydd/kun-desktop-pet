@@ -20,6 +20,7 @@
     "启动桌宠.vbs",
     "start-pet.vbs",
     "启动桌宠.bat",
+    "ensure-pet-shortcut.ps1",
     "make-shortcut.ps1",
     "make-icon.ps1",
     "version.json"
