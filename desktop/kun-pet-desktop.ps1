@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.2'
+    Version     = '2.4.3'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -357,8 +357,10 @@ $xaml = @'
         </StackPanel>
       </Border>
       <!-- 气泡与小宠贴合：尾巴叠在气泡下方（Grid 叠层，不占额外行高），
-           并用负边距把气泡压到贴近头顶 -->
-      <Grid HorizontalAlignment="Center" Margin="0,0,10,0" Panel.ZIndex="3">
+           并用负边距把气泡压到贴近头顶。
+           bubbleWrap 命名是为了整体收起：没任务时气泡不该一直挂着，
+           隐藏时要连小尾巴一起收（只藏气泡会剩一条孤零零的尾巴） -->
+      <Grid x:Name="bubbleWrap" HorizontalAlignment="Center" Margin="0,0,10,0" Panel.ZIndex="3">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="Auto"/>
@@ -432,6 +434,7 @@ $sheetPetEl     = $window.FindName('sheetPet')
 $badgeTextEl    = $window.FindName('badgeText')
 $bubbleTextEl   = $window.FindName('bubbleText')
 $bubbleEl       = $window.FindName('bubble')
+$bubbleWrapEl   = $window.FindName('bubbleWrap')
 $alertBorderEl  = $window.FindName('alertBorder')
 $alertTextEl    = $window.FindName('alertText')
 $progressTextEl = $window.FindName('progressText')
@@ -634,6 +637,25 @@ function Note-TickError([string]$where, $err) {
     if ($script:tickErrors -lt 25) {
         $script:tickErrors++
         Write-Log ("{0} error: {1}" -f $where, $err.Exception.Message)
+    }
+}
+
+# ---------------- 后台任务（所有不能在 UI 线程上做的 I/O 统一走这里）----------------
+# 背景（实测踩过的坑）：DispatcherTimer 的回调跑在 UI 线程，里面任何同步网络 I/O
+# 都会把桌宠整个冻住——气泡不重绘、点不动，正是「宠物完全静止、操作不了」的
+# 一种来源。检查更新最初就是同步联网（冻 ~10 秒），后来「执行更新」又重蹈覆辙
+# （下载替换 11 个文件期间全冻结）。这里的模式：UI 线程只登记任务，真正的 I/O
+# 跑在独立 runspace；完成的任务由轮询定时器把结果交回 UI 线程执行回调。
+$script:bgOps = New-Object System.Collections.ArrayList
+function Start-BgOp([scriptblock]$body, $bgArgs, [scriptblock]$onDone, [string]$where) {
+    try {
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript([string]$body)
+        foreach ($a in @($bgArgs)) { [void]$ps.AddArgument($a) }
+        $handle = $ps.BeginInvoke()
+        [void]$script:bgOps.Add(@{ ps = $ps; handle = $handle; onDone = $onDone; where = $where })
+    } catch {
+        Note-TickError $where $_
     }
 }
 
@@ -1122,6 +1144,14 @@ if (-not (Get-Command -Name 'Resolve-BubbleText' -CommandType Function -ErrorAct
         return @{ bubble = [string]$normalText; noticeText = [string]$noticeText }
     }
 }
+if (-not (Get-Command -Name 'Resolve-BubbleVisibility' -CommandType Function -ErrorAction SilentlyContinue)) {
+    # 兜底 = 旧行为：气泡常显（宁可多显示也不能因为模块缺失把气泡藏没了）
+    function Resolve-BubbleVisibility([bool]$worth, $idleSince, $now, [int]$graceMs = 6000) {
+        return @{ visible = $true; idleSince = $null }
+    }
+}
+# 「没话可说」的计时起点（Resolve-BubbleVisibility 在帧间传递的游标）
+$script:bubbleIdleSince = $null
 
 # ---------------- 更新模块（检查更新 / 一键更新） ----------------
 # 同样单独成文件：版本比较、文件筛选、内容校验、原子替换与回滚都是可自测的逻辑。
@@ -1688,11 +1718,7 @@ function Send-ApprovalDecision([string]$decision) {
         if ($items.Count -eq 0) { return }
         $first = $items[0]
         $id = [string]$first.id
-        $base = (Resolve-EndpointUrl) -replace '/kun-pet/state$', ''
-        $body = (@{ id = $id; decision = $decision } | ConvertTo-Json)
-        $result = Invoke-RestMethod -Uri ($base + '/kun-pet/approval') -Method Post `
-            -ContentType 'application/json; charset=utf-8' -Body $body -TimeoutSec 2
-        # 乐观移除当前项，下一轮轮询与真源对齐
+        # 即时反馈 + 乐观移除当前项（下一轮轮询与真源对齐），不再等 POST 回来
         $state.approvalItems = @($items | Select-Object -Skip 1)
         if (@($state.approvalItems).Count -eq 0) {
             $approvalBorderEl.Visibility = 'Collapsed'
@@ -1701,7 +1727,24 @@ function Send-ApprovalDecision([string]$decision) {
         if ($decision -eq 'allowed-once') { Set-Action 'jumping' 1200 } else { Set-Action 'waving' 1200 }
         Play-Tones -freqs @(660, 880) -durMs 90 -gapMs 90
         Write-Log ('approval {0}: {1} ({2})' -f $decision, [string]$first.toolName, $id)
-        try { if ($result -and $result.ok -eq $false) { Write-Log ('approval already handled: ' + $id) } } catch { }
+        # POST 丢后台：原来在 UI 线程同步发（超时 2 秒），端点 hang 时一点按钮桌宠就冻住。
+        # 结果只用于记一行日志，没有必须等它的 UI 逻辑。
+        # （onDone 在 UI 线程的独立作用域里执行，拿不到本函数的局部变量，
+        #   所以 id 要先放到 script 作用域再传进去。）
+        $base = (Resolve-EndpointUrl) -replace '/kun-pet/state$', ''
+        $postBody = (@{ id = $id; decision = $decision } | ConvertTo-Json)
+        $script:lastApprovalPostId = $id
+        Start-BgOp {
+            param($url, $body)
+            return (Invoke-RestMethod -Uri $url -Method Post -ContentType 'application/json; charset=utf-8' -Body $body -TimeoutSec 2)
+        } @(($base + '/kun-pet/approval'), $postBody) {
+            param($result, $errText)
+            if ($errText) {
+                Write-Log ('approval send failed: ' + $errText)
+                return
+            }
+            try { if ($result -and $result.ok -eq $false) { Write-Log ('approval already handled: ' + [string]$script:lastApprovalPostId) } } catch { }
+        } 'approval-send'
     } catch {
         Note-TickError 'approval-send' $_
         Write-Log ('approval send failed: ' + $_.Exception.Message)
@@ -2394,6 +2437,9 @@ $menu.Items.Add($miPi) | Out-Null
 #   改成后台 runspace 后，UI 全程可响应，提示能立刻画出来。
 $script:updateJob = $null
 $script:updatePollTimer = $null
+# 第二阶段（下载+替换）的后台任务：与版本检查同款的双 runspace 结构
+$script:updateApplyJob = $null
+$script:updateApplyTimer = $null
 
 $miUpdate = [System.Windows.Forms.ToolStripMenuItem]::new('检查更新…')
 $miUpdate.add_Click({
@@ -2526,21 +2572,76 @@ $miUpdate.add_Click({
                     return
                 }
 
-                # ---- 执行更新（同样丢后台，避免替换文件时 UI 冻住）----
-                Write-Log ("update: start (local=$cur remote=$remote)")
-                Show-Notice ("⬇ 正在更新到 v$remote…`n请稍候") 60
-                $r = Invoke-PetUpdate $script:logDir $cur $script:logDir
-                if ($r.ok -and $r.status -eq 'updated') {
-                    Write-Log ("update: ok, replaced " + ((@($r.files)) -join ','))
-                    Show-Notice ("🎉 已更新到 v$remote`n共 $((@($r.files)).Count) 个文件，即将重启") 30
-                    Start-Sleep -Milliseconds 1200
-                    Restart-Pet
-                } else {
-                    $err = $r.error
-                    if (-not $err) { $err = "状态：$($r.status)" }
-                    Show-Notice ("⚠ 更新失败，文件保持原样`n" + (Limit-Text $err 60)) 15
-                    Write-Log ("update: failed - " + $err)
+                # ---- 执行更新：下载与替换也丢后台 runspace ----
+                # 修复：这里原来在 UI 线程同步跑 Invoke-PetUpdate（下载 11 个文件 +
+                # 逐个校验 + 替换），期间桌宠整个冻住——气泡不重绘、点不动，
+                # 与「宠物完全静止、操作不了」的观感一模一样。现在改成后台跑、
+                # 定时器收结果，UI 全程可响应。
+                # 注意：这里拿不到外层点击处理器里的 $base（那是它的局部变量），
+                # 必须从已存的 job 里取。
+                if ($null -ne $script:updateApplyJob) {
+                    Show-Notice '⏳ 上一次更新还在进行，请稍候…' 4
+                    return
                 }
+                Write-Log ("update: start (local=$cur remote=$remote)")
+                Show-Notice ("⬇ 正在更新到 v$remote…`n请稍候") 90
+                $script:updateApplyJob = @{ cur = $cur; remote = $remote }
+                $applyPs = [powershell]::Create()
+                [void]$applyPs.AddScript({
+                    param($modPath, $base, $targetDir, $curVer, $backupRoot)
+                    . $modPath
+                    Set-UpdateSource $base
+                    return (Invoke-PetUpdate $targetDir $curVer $backupRoot)
+                })
+                [void]$applyPs.AddArgument([string]$script:updateModulePath)
+                [void]$applyPs.AddArgument([string]$job.base)
+                [void]$applyPs.AddArgument([string]$script:logDir)
+                [void]$applyPs.AddArgument([string]$cur)
+                [void]$applyPs.AddArgument([string]$script:logDir)
+                $script:updateApplyJob.ps = $applyPs
+                $script:updateApplyJob.handle = $applyPs.BeginInvoke()
+
+                $script:updateApplyTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $script:updateApplyTimer.Interval = [TimeSpan]::FromMilliseconds(300)
+                $script:updateApplyTimer.Add_Tick({
+                    try {
+                        $apply = $script:updateApplyJob
+                        if ($null -eq $apply -or $null -eq $apply.handle) {
+                            try { $script:updateApplyTimer.Stop() } catch { }
+                            return
+                        }
+                        if (-not $apply.handle.IsCompleted) { return }
+                        $script:updateApplyTimer.Stop()
+                        $result = $null
+                        try { $result = $apply.ps.EndInvoke($apply.handle) } catch { }
+                        try { $apply.ps.Dispose() } catch { }
+                        $script:updateApplyJob = $null
+
+                        $r = $null
+                        if ($null -ne $result -and $result.Count -gt 0) { $r = $result[0] }
+                        $remoteDone = [string]$apply.remote
+                        if ($null -ne $r -and $r.ok -eq $true -and [string]$r.status -eq 'updated') {
+                            $filesDone = @($r.files)
+                            Write-Log ("update: ok, replaced " + ($filesDone -join ','))
+                            Show-Notice ("🎉 已更新到 v$remoteDone`n共 $($filesDone.Count) 个文件，即将重启") 30
+                            Start-Sleep -Milliseconds 1200
+                            Restart-Pet
+                        } else {
+                            $err = ''
+                            try { $err = [string]$r.error } catch { }
+                            if (-not $err -and $null -ne $r) { $err = "状态：$([string]$r.status)" }
+                            elseif (-not $err) { $err = '后台任务没有返回结果' }
+                            Show-Notice ("⚠ 更新失败，文件保持原样`n" + (Limit-Text $err 60)) 15
+                            Write-Log ("update: failed - " + $err)
+                        }
+                    } catch {
+                        Note-TickError 'update-apply' $_
+                        try { $script:updateApplyTimer.Stop() } catch { }
+                        $script:updateApplyJob = $null
+                        Show-Notice '⚠ 更新过程出错，文件保持原样（详见日志）' 12
+                    }
+                })
+                $script:updateApplyTimer.Start()
             } catch {
                 Note-TickError 'update-poll' $_
                 try { if ($script:updatePollTimer) { $script:updatePollTimer.Stop() } } catch { }
@@ -2629,6 +2730,27 @@ $miReset.add_Click({
 })
 $menu.Items.Add($miReset) | Out-Null
 
+# 「修复卡住状态」：万一交互状态卡死（拖拽/菜单残留导致点不动、气泡不更新），
+# 一键复位。宠物窗口本身点不动时，托盘菜单是独立入口，这里永远够得着；
+# 轮询里的看门狗会自动修绝大多数情况，这项是给它兜底 + 给用户一个主动开关。
+$miUnstick = [System.Windows.Forms.ToolStripMenuItem]::new('修复卡住状态（点不动时用）')
+$miUnstick.add_Click({
+    try {
+        $script:dragStart = $null
+        $state.dragging = $false
+        $state.menuOpen = $false
+        $script:clickPending = $false
+        try { $script:clickTimer.Stop() } catch { }
+        try { $menu.Close() } catch { }
+        try { $window.Topmost = $false; $window.Topmost = $true } catch { }
+        Show-Notice '已重置交互状态' 5
+        Write-Log 'manual unfreeze: interaction state reset'
+    } catch {
+        Note-TickError 'unfreeze' $_
+    }
+})
+$menu.Items.Add($miUnstick) | Out-Null
+
 # 桌面快捷方式：随机挑一只已安装的宠物做成图标。再点一次会换一只 / 换一帧。
 $miShortcut = [System.Windows.Forms.ToolStripMenuItem]::new('创建桌面快捷方式')
 $miShortcut.add_Click({
@@ -2638,42 +2760,58 @@ $miShortcut.add_Click({
             Show-Notice '找不到快捷方式脚本' 8
             return
         }
-        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $psExe
-        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $maker + '" -PetDir "' + $script:logDir + '"'
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-        $proc = New-Object System.Diagnostics.Process
-        $proc.StartInfo = $psi
-        [void]$proc.Start()
-        $outTask = $proc.StandardOutput.ReadToEndAsync()
-        $errTask = $proc.StandardError.ReadToEndAsync()
-        $proc.WaitForExit()
-        $stdout = ''
-        $stderr = ''
-        try { $stdout = [string]$outTask.Result } catch { }
-        try { $stderr = [string]$errTask.Result } catch { }
-        if ($proc.ExitCode -eq 0) {
-            Update-TrayIcon
-            $label = '随机小宠物'
-            $metaPath = Join-Path $script:logDir 'assets\kun-pet-icon.json'
-            if (Test-Path -LiteralPath $metaPath) {
-                try {
-                    $m = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                    if ($m.displayName) { $label = [string]$m.displayName }
-                } catch { }
+        # 丢后台：原来 WaitForExit 同步等 make-shortcut.ps1 跑完（画图标 + 建 .lnk，
+        # 期间桌宠整个冻住几秒）。现在 UI 线程只登记任务，结果回来再更新托盘与气泡。
+        Show-Notice '正在创建桌面快捷方式…' 4
+        $bgMaker = [string]$maker
+        $bgDir = [string]$script:logDir
+        Start-BgOp {
+            param($makerPath, $petDir)
+            $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $psExe
+            $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $makerPath + '" -PetDir "' + $petDir + '"'
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $psi
+            [void]$proc.Start()
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $proc.WaitForExit()
+            $stdout = ''
+            $stderr = ''
+            try { $stdout = [string]$outTask.Result } catch { }
+            try { $stderr = [string]$errTask.Result } catch { }
+            return @{ code = [int]$proc.ExitCode; stdout = $stdout; stderr = $stderr }
+        } @($bgMaker, $bgDir) {
+            param($result, $errText)
+            if ($errText) {
+                Write-Log ('desktop shortcut failed: ' + $errText)
+                Show-Notice '桌面快捷方式没做成，详情在日志里' 8
+                return
             }
-            Show-Notice ("桌面快捷方式已放好`n这次的图标是「{0}」" -f $label) 8
-            Write-Log ('desktop shortcut ready: ' + (($stdout -replace '\s+', ' ').Trim()))
-        } else {
-            Write-Log ('desktop shortcut failed: ' + $stderr)
-            Show-Notice '桌面快捷方式没做成，详情在日志里' 8
-        }
+            if ($result.code -eq 0) {
+                Update-TrayIcon
+                $label = '随机小宠物'
+                $metaPath = Join-Path $script:logDir 'assets\kun-pet-icon.json'
+                if (Test-Path -LiteralPath $metaPath) {
+                    try {
+                        $m = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                        if ($m.displayName) { $label = [string]$m.displayName }
+                    } catch { }
+                }
+                Show-Notice ("桌面快捷方式已放好`n这次的图标是「{0}」" -f $label) 8
+                Write-Log ('desktop shortcut ready: ' + (([string]$result.stdout -replace '\s+', ' ').Trim()))
+            } else {
+                Write-Log ('desktop shortcut failed: ' + [string]$result.stderr)
+                Show-Notice '桌面快捷方式没做成，详情在日志里' 8
+            }
+        } 'shortcut'
     } catch {
         Note-TickError 'shortcut' $_
         Show-Notice '桌面快捷方式没做成' 8
@@ -2711,6 +2849,9 @@ $menu.add_Closed({
 function Show-PetMenu {
     try {
         $state.menuOpen = $true
+        # 先关一次：上次菜单若处于半开状态（Closed 偶发不触发，menuOpen 就卡 true），
+        # 直接 Show 会把那个僵尸状态带进来；关掉能让状态机重新走一遍 Opening/Closed
+        try { if ($menu.Visible) { $menu.Close() } } catch { }
         $menu.Show([System.Windows.Forms.Cursor]::Position)
     } catch {
         $state.menuOpen = $false
@@ -2832,10 +2973,81 @@ Write-Log ('version: ' + (Get-PetVersion) + ' · update module: ' + $(if ($scrip
 if ($state.paused) { Render-PausedFrame }
 
 # ---------------- 轮询 ----------------
+# 看门狗游标（卡住自愈用，见下面 Add_Tick 顶部的说明）
+$script:dragStuckTicks = 0
+$script:menuStuckTicks = 0
+$script:dragStart = $null
 $pollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $pollTimer.Interval = [TimeSpan]::FromMilliseconds($Config.PollMs)
 $pollTimer.Add_Tick({
     try {
+        # ---- 卡住自愈（看门狗）：必须放在「拖拽/菜单跳过轮询」之前 ----
+        # 两个真实发生过的卡死形态（用户反馈「宠物完全静止、操作不了」）：
+        #   1) 拖拽状态残留：按下后 MouseUp 没送达（鼠标捕获被弹窗/菜单模态循环
+        #      抢走、捕获失败被静默吞掉）→ dragging 永远为 true，轮询被跳过、
+        #      气泡冻结；dragStart 残留更会让窗口在鼠标悬停时「粘」着光标跑。
+        #   2) 菜单状态残留：WinForms 菜单 + WPF 无焦点窗口混用，Opening 触发后
+        #      Closed 偶发不触发 → menuOpen 卡 true，气泡/轮询全部停更。
+        # 两者都靠「实际输入状态」做权威裁决：左键根本没按下、菜单根本不可见，
+        # 却还声称在拖拽/菜单开着 —— 连续几轮如此就强制复位并记日志。
+        try {
+            $lbPressed = ([System.Windows.Input.Mouse]::LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed)
+            if ($lbPressed) {
+                $script:dragStuckTicks = 0
+            } elseif ([bool]$state.dragging -or $null -ne $script:dragStart) {
+                $script:dragStuckTicks++
+                if ($script:dragStuckTicks -ge 3) {
+                    $script:dragStuckTicks = 0
+                    Write-Log ('watchdog: cleared stuck drag state (dragging={0}, dragStart={1})' -f [bool]$state.dragging, ($null -ne $script:dragStart))
+                    $script:dragStart = $null
+                    $state.dragging = $false
+                }
+            } else {
+                $script:dragStuckTicks = 0
+            }
+            if ([bool]$state.menuOpen) {
+                $menuReallyOpen = $true
+                try { $menuReallyOpen = [bool]$menu.Visible } catch { $menuReallyOpen = $true }
+                if ($menuReallyOpen) {
+                    $script:menuStuckTicks = 0
+                } else {
+                    $script:menuStuckTicks++
+                    if ($script:menuStuckTicks -ge 3) {
+                        $script:menuStuckTicks = 0
+                        Write-Log 'watchdog: cleared stuck menuOpen (menu not visible)'
+                        $state.menuOpen = $false
+                    }
+                }
+            } else {
+                $script:menuStuckTicks = 0
+            }
+        } catch { }
+
+        # ---- 后台任务收尾：把跑完的后台 runspace 结果交回 UI 线程执行回调 ----
+        # 也要放在「跳过轮询」的 return 之前：菜单开着/拖拽时后台任务照样要能收尾。
+        if ($script:bgOps.Count -gt 0) {
+            try {
+                $finished = @()
+                foreach ($op in @($script:bgOps)) {
+                    try { if ($op.handle.IsCompleted) { $finished += $op } } catch { }
+                }
+                foreach ($op in $finished) {
+                    try { [void]$script:bgOps.Remove($op) } catch { }
+                    $result = $null
+                    $errText = ''
+                    try {
+                        $out = $op.ps.EndInvoke($op.handle)
+                        if ($null -ne $out -and $out.Count -gt 0) { $result = $out[0] }
+                    } catch {
+                        $errText = $_.Exception.Message
+                    } finally {
+                        try { $op.ps.Dispose() } catch { }
+                    }
+                    try { & $op.onDone $result $errText } catch { Note-TickError ([string]$op.where) $_ }
+                }
+            } catch { Note-TickError 'bg-drain' $_ }
+        }
+
         # 拖拽时跳过：轮询会读会话文件 / 打 HTTP，占住 UI 线程，
         # 跟 MouseMove 抢调度，窗口就会一顿一顿。拖一下通常不到 2 秒，漏一两轮没关系。
         $tickPlan = Get-PetTickPlan @{ dragging = [bool]$state.dragging; paused = [bool]$state.paused; menuOpen = [bool]$state.menuOpen; walking = (Test-PetIsWalking) }
@@ -3257,6 +3469,22 @@ $animTimer.Add_Tick({
         if ([string]$state.noticeText -ne [string]$rb.noticeText) { $state.noticeText = $rb.noticeText }
         if ($bubbleTextEl.Text -ne $bubbleValue) { $bubbleTextEl.Text = $bubbleValue }
 
+        # 气泡可见性：有话可说才显示。没任务、没提示、没反应时，过完宽限期就
+        # 整体收起（含小尾巴），「怎么还不来找我~」不再常驻桌面；
+        # 一有新内容（任务开始 / 等你确认 / 临时提示 / 你点了它）立即重新展开。
+        # 判定逻辑在 kun-pet-ui.ps1（纯函数，tests/test-notice.ps1 直接测它）。
+        $worthShowing = (
+            ($waitKindLabel -ne '') -or
+            (([string]$rb.noticeText) -ne '') -or
+            (([string]$state.progressText) -ne '') -or
+            ($null -ne $state.reaction -and (Get-Date) -lt $state.reactionEnd) -or
+            ([string]$state.mode -eq 'failed')
+        )
+        $bvis = Resolve-BubbleVisibility $worthShowing $script:bubbleIdleSince (Get-Date)
+        $script:bubbleIdleSince = $bvis.idleSince
+        $bubbleVis = if ($bvis.visible) { 'Visible' } else { 'Collapsed' }
+        if ([string]$bubbleWrapEl.Visibility -ne $bubbleVis) { $bubbleWrapEl.Visibility = $bubbleVis }
+
         # 等待提示换配色：提问=琥珀，审批=绿（与面板上的 ✓/✗ 呼应）
         if ($script:bubbleTint -ne $waitKindLabel) {
             $script:bubbleTint = $waitKindLabel
@@ -3493,6 +3721,26 @@ $window.Add_MouseLeftButtonUp({
             }
         }
     } catch { Note-TickError 'click' $_ }
+})
+
+# 拖拽状态的事件兜底：鼠标捕获被弹窗/菜单/系统键抢走时，MouseUp 永远不会再来。
+# 不清掉的话 dragging 残留 = 轮询停更、气泡冻结；dragStart 残留还会让窗口在
+# 鼠标悬停时「粘」着光标跑（表现就是点不动、抓不住）。看门狗之外再加两道即时清理。
+$window.Add_LostMouseCapture({
+    try {
+        if ($null -ne $script:dragStart -or [bool]$state.dragging) {
+            $script:dragStart = $null
+            $state.dragging = $false
+        }
+    } catch { }
+})
+$window.Add_Deactivated({
+    try {
+        if ($null -ne $script:dragStart -or [bool]$state.dragging) {
+            $script:dragStart = $null
+            $state.dragging = $false
+        }
+    } catch { }
 })
 
 # 滚轮缩放：悬停在小宠上滚动即可改大小（与图片查看器一致的手感）

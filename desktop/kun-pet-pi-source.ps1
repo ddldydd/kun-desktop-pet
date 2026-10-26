@@ -93,6 +93,13 @@ if ($null -eq $script:piEnabled) { $script:piEnabled = $true }
 
 $script:piDocCache = @{}      # path -> @{ stamp; header; state }
 $script:piRunPrev = @{}       # sessionId -> 上一帧是否在跑（逐会话下降沿）
+# 上一帧「在跑」的会话**文件路径**集合。候选筛选阶段的「跟踪中的保留」查它：
+# 那时还没解析文件拿不到会话 id，只能按路径跟踪（旧代码查 piRunPrev 的文件名键，
+# 但那张表实际按会话 id 存键，永远查不到 → 跟踪保留从未生效）。
+$script:piPrevPaths = @{}     # fileFullName -> $true
+# 嵌套会话文件（子代理产物）的「已记过日志」集合：否则每 500ms 轮询都会为
+# 同一批文件各写一行 skip 日志，日志文件每秒膨胀数行。
+$script:piSkippedLogged = @{}
 $script:piCompletionAt = 0    # 最近一次「某会话刚收尾」的时间（epoch ms）
 $script:piCompletionSummary = $null
 $script:piMissingLogged = $false
@@ -112,6 +119,8 @@ function Set-PiSourcePaths([string]$sessionsRoot, [string]$stateFile) {
     # 路径变了就把解析缓存清掉，避免拿着旧路径的结果继续用
     $script:piDocCache = @{}
     $script:piRunPrev = @{}
+    $script:piPrevPaths = @{}
+    $script:piSkippedLogged = @{}
 }
 
 function Set-PiEnabled([bool]$enabled) {
@@ -119,6 +128,7 @@ function Set-PiEnabled([bool]$enabled) {
     if (-not $script:piEnabled) {
         $script:piDocCache = @{}
         $script:piRunPrev = @{}
+        $script:piPrevPaths = @{}
     }
 }
 
@@ -140,6 +150,7 @@ function Reset-PiCompletionState {
     $script:piCompletionAt = 0
     $script:piCompletionSummary = $null
     $script:piRunPrev = @{}
+    $script:piPrevPaths = @{}
 }
 
 function Restore-PiCompletionState([int64]$at, $summary) {
@@ -573,7 +584,12 @@ function Get-StateFromPiSessions {
             $levels = Get-PiLevelsBelowRoot $f.Directory $rootFull
             if ($levels -lt 0 -or $levels -gt 1) {
                 # levels<0：不在 root 下（异常情况）；levels>1：在子目录里 → 子代理产物
-                Write-Log ('pi source: skipped nested session file (likely subagent artifact): {0}' -f $f.FullName)
+                # 日志每个文件只记一次（表太大了就整表重置，宁可重记也不无限增长）
+                if (-not $script:piSkippedLogged.ContainsKey($f.FullName)) {
+                    if ($script:piSkippedLogged.Count -gt 200) { $script:piSkippedLogged = @{} }
+                    $script:piSkippedLogged[$f.FullName] = $true
+                    Write-Log ('pi source: skipped nested session file (likely subagent artifact): {0}' -f $f.FullName)
+                }
                 continue
             }
             [void]$sessionFiles.Add($f)
@@ -581,12 +597,14 @@ function Get-StateFromPiSessions {
         if ($sessionFiles.Count -eq 0) { return $null }
 
         # 候选：最近 piCandidateSec 内写过的 + 之前跟踪中的（保证收尾下降沿能被观测到）
+        # 「跟踪中」查的是按**文件路径**记的 piPrevPaths——旧代码查 piRunPrev 的
+        # 文件名键，而那张表实际按会话 id 存键，永远查不到（等于没有跟踪保留）。
         $now = Get-Date
         $candidates = New-Object System.Collections.ArrayList
         foreach ($f in $sessionFiles) {
             $ageSec = ($now - $f.LastWriteTime).TotalSeconds
             $tracked = $false
-            try { $tracked = $script:piRunPrev.ContainsKey([string]$f.Name) } catch { }
+            try { $tracked = $script:piPrevPaths.ContainsKey([string]$f.FullName) } catch { }
             if ($ageSec -le $script:piCandidateSec -or $tracked) {
                 [void]$candidates.Add($f)
             }
@@ -601,6 +619,7 @@ function Get-StateFromPiSessions {
         # (a) 先把候选会话全部求值（含逐会话下降沿），(b) 再聚合。
         $seen = New-Object System.Collections.ArrayList
         $seenIds = @{}
+        $seenPaths = @{}
         $anyFresh = $false
         $nowMs0 = [int64]((Get-Date).ToUniversalTime() - $script:epochRef).TotalMilliseconds
 
@@ -608,6 +627,8 @@ function Get-StateFromPiSessions {
             $state = Get-PiFileState $f
             if ($null -eq $state) { continue }
 
+            $fPath = [string]$f.FullName
+            $seenPaths[$fPath] = $true
             $sid = [string]$state.id
             if ($sid) { $seenIds[$sid] = $true }
 
@@ -615,6 +636,9 @@ function Get-StateFromPiSessions {
             $wasRunning = $false
             if ($sid -and $script:piRunPrev.ContainsKey($sid)) { $wasRunning = [bool]$script:piRunPrev[$sid] }
             if ($sid) { $script:piRunPrev[$sid] = [bool]$verdict.running }
+            # 路径跟踪表与 id 表同步维护：候选筛选阶段靠它保留「之前在跑」的会话
+            if ($verdict.running) { $script:piPrevPaths[$fPath] = $true }
+            else { try { [void]$script:piPrevPaths.Remove($fPath) } catch { } }
 
             # ---- 逐会话下降沿 = 「这一轮结束了」----
             # 必须逐会话记「上一帧是否在跑」。共用一个全局标记时，B 会话的静止会被
@@ -714,10 +738,15 @@ function Get-StateFromPiSessions {
         $recentError = ($recentErrorAt -gt 0 -and
                         ($nowMs0 - $recentErrorAt) -lt ($script:piRecentErrorSec * 1000))
 
-        # 跟踪表裁剪：会话文件被删/改名后不要无限增长
+        # 跟踪表裁剪：会话文件被删/改名后不要无限增长（id 表与路径表都要裁）
         if ($script:piRunPrev.Count -gt 64) {
             foreach ($k in @($script:piRunPrev.Keys)) {
                 if (-not $seenIds.ContainsKey($k)) { [void]$script:piRunPrev.Remove($k) }
+            }
+        }
+        if ($script:piPrevPaths.Count -gt 64) {
+            foreach ($k in @($script:piPrevPaths.Keys)) {
+                if (-not $seenPaths.ContainsKey($k)) { [void]$script:piPrevPaths.Remove($k) }
             }
         }
 
