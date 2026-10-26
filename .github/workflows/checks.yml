@@ -263,7 +263,7 @@ jobs:
           # 显式 UTF8 读：Windows PowerShell 5.1 的 Get-Content 默认按 ANSI 解码，
           # 无 BOM 的 UTF-8 中文会被读成乱码并破坏 JSON（ubuntu pwsh7 无此问题，
           # 但本地 Windows 调试时会误报版本不一致）。
-          $vj = ([IO.File]::ReadAllText('$PWD/desktop/version.json', [Text.Encoding]::UTF8) | ConvertFrom-Json).version
+          $vj = ([IO.File]::ReadAllText("$PWD/desktop/version.json", [Text.Encoding]::UTF8) | ConvertFrom-Json).version
           $m = Select-String -Path ./desktop/kun-pet-desktop.ps1 -Pattern "Version\s*=\s*'([^']+)'"
           if (-not $m) { Write-Host "::error::脚本里找不到 Version 兜底值"; exit 1 }
           $v2 = $m.Matches[0].Groups[1].Value
