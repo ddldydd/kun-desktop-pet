@@ -1,4 +1,4 @@
-﻿<#
+<#
   Kun Like 桌宠 · 桌面版 v2（对齐 Codex / petdex 桌宠规格）
 
   对齐的 Codex 桌宠功能：
@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.6'
+    Version     = '2.4.7'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -2137,8 +2137,11 @@ function Update-Alerts($snap) {
         # 只有来自真实状态源的快照才能触发提醒，活跃度兜底来源不参与，避免误报。
         # 'pi' 是真实源（pi 会话 JSONL / pi 扩展状态文件），同样要能喊人 ——
         # 否则 pi 那边的「任务结束 / 出错 / 等你确认」全都不会提示。
+        # DSH+pi 并列在跑时的合并快照带 combinedSource='dsh+pi'（source 保持 DSH 侧原值），
+        # 同样是真实源 —— 少了这个判断，两边同时在跑时的等待/完成提醒会被当成兜底静音。
         $isRealSource = ($null -ne $snap -and $snap.ContainsKey('source') -and
-                         ($snap.source -eq 'harness' -or $snap.source -eq 'dsh' -or $snap.source -eq 'pi'))
+                         ($snap.source -eq 'harness' -or $snap.source -eq 'dsh' -or $snap.source -eq 'pi' -or
+                          ($snap.ContainsKey('combinedSource') -and $snap.combinedSource -eq 'dsh+pi')))
         if ($isRealSource) {
             # 气泡前缀：让「是哪个 agent 在等你」一目了然
             $who = 'Harness'
@@ -3250,12 +3253,21 @@ $pollTimer.Add_Tick({
             $snap = $piSnap
             $state.agentSource = 'pi'
         } elseif ($null -ne $snap -and $null -ne $piSnap) {
-            # 两边都有：按优先级合并
+            # 两边都有：按优先级合并。
+            # 【不原地改快照】$snap 往往直接引用某个源的**节流缓存对象**（Get-StateFromHarness
+            # 1 秒节流 / pi 源 2 秒节流都原样返回缓存）。过去直接往 $snap 上写
+            # progressLines/message/toolCount，等于把合并结果写进了缓存 —— 下一帧再合并一次
+            # 就变成 [DSH] [DSH] …，气泡每 500ms 变宽一次，正是 pi+DSH 同时在跑时「一闪一闪」。
+            # 现在合并产物全部写进一个新哈希表，任何源的缓存都保持只读。
+            # 合并快照标记 combinedSource='dsh+pi'（而不是复用 source 字段）：
+            # Update-Alerts 用 source 判定「能不能喊人」，把 'dsh+pi' 写进 source 会让
+            # 两边同时在跑时的完成/等待提醒被当成兜底来源而静音。
             $dshWaiting = $false; $piWaiting = $false
             try { $dshWaiting = [bool]$snap.waiting } catch { }
             try { $piWaiting = [bool]$piSnap.waiting } catch { }
             $dshRunning = ($snap.mode -eq 'working' -or $snap.mode -eq 'review')
             $piRunning = ($piSnap.mode -eq 'working' -or $piSnap.mode -eq 'review')
+            $combined = $null
 
             if ($dshWaiting -or $piWaiting) {
                 # 任一侧在等你，就以那一侧为准（两侧都在等时优先 DSH，气泡仍会显示等待）
@@ -3276,23 +3288,37 @@ $pollTimer.Add_Tick({
                     if ($l) { $merged += ('[DSH] ' + ([string]$l -replace '^·\s*', '')) }
                 }
                 foreach ($l in @($piSnap.progressLines)) {
-                    if ($l) { $merged += ('[pi] ' + ([string]$l -replace '^·\s*', '')) }
+                    # pi 会话尾随自己已经加了「· [pi] 」前缀（多窗口区分用），别再加一层
+                    if ($l -and ([string]$l -notmatch '(^| )\[pi\]')) { $merged += ('[pi] ' + ([string]$l -replace '^·\s*', '')) }
+                    elseif ($l) { $merged += ([string]$l -replace '^·\s*', '') }
                 }
                 if ($merged.Count -eq 0) {
                     $merged += ('[DSH] ' + [string]$snap.message)
                     $merged += ('[pi] ' + [string]$piSnap.message)
                 }
-                $snap.progressLines = @($merged)
                 # 任务数用两侧真实计数相加，而不是假设 DSH 只有 1 个
                 $dshAgents = 0
                 try { $dshAgents = [int]$snap.runningAgents } catch { $dshAgents = 1 }
                 if ($dshAgents -le 0) { $dshAgents = 1 }
                 $totalAgents = $dshAgents + [int]$piSnap.runningAgents
                 if ($totalAgents -le 0) { $totalAgents = 2 }
-                $snap.message = ('{0} 个任务进行中（DSH + pi）' -f $totalAgents)
-                # 计数与工具名取两边的合并值，让「第 N 次工具调用」不至于偏小
-                try { $snap.toolCount = [int]$snap.toolCount + [int]$piSnap.toolCount } catch { }
-                if (-not $snap.lastTool) { $snap.lastTool = $piSnap.lastTool }
+                $toolSum = 0
+                try { $toolSum = [int]$snap.toolCount + [int]$piSnap.toolCount } catch { $toolSum = [int]$snap.toolCount }
+                $lastToolValue = $null
+                try { if ($snap.lastTool) { $lastToolValue = [string]$snap.lastTool } } catch { }
+                if (-not $lastToolValue) { try { if ($piSnap.lastTool) { $lastToolValue = [string]$piSnap.lastTool } } catch { } }
+                $combined = @{
+                    mode          = [string]$snap.mode
+                    seq           = [int]$snap.seq
+                    source        = 'harness'
+                    combinedSource = 'dsh+pi'
+                    message       = ('{0} 个任务进行中（DSH + pi）' -f $totalAgents)
+                    progressLines = @($merged)
+                    # 计数与工具名取两边的合并值，让「第 N 次工具调用」不至于偏小
+                    toolCount     = $toolSum
+                    lastTool      = $lastToolValue
+                }
+                $snap = $combined
             } elseif ($piRunning -and -not $dshRunning) {
                 # DSH 闲着、pi 在跑 → 用 pi（否则 pi 的进展永远显示不出来）
                 $snap = $piSnap

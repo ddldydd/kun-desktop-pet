@@ -108,11 +108,34 @@ try {
             $agentSource = 'dsh+pi'
             $merged = @()
             foreach ($l in @($snap.progressLines)) { if ($l) { $merged += ('[DSH] ' + ([string]$l -replace '^·\s*', '')) } }
-            foreach ($l in @($piSnap.progressLines)) { if ($l) { $merged += ('[pi] ' + ([string]$l -replace '^·\s*', '')) } }
-            $snap.progressLines = @($merged)
-            $dshAgents = [int]$snap.runningAgents
-            if ($dshAgents -le 0) { $dshAgents = 1 }
-            $snap.message = ('{0} 个任务进行中（DSH + pi）' -f ($dshAgents + [int]$piSnap.runningAgents))
+            foreach ($l in @($piSnap.progressLines)) {
+                # pi 会话尾随自己已经加了「· [pi] 」前缀（多窗口区分用），别再加一层
+                if ($l -and ([string]$l -notmatch '(^| )\[pi\]')) { $merged += ('[pi] ' + ([string]$l -replace '^·\s*', '')) }
+                elseif ($l) { $merged += ([string]$l -replace '^·\s*', '') }
+            }
+            if ($merged.Count -eq 0) {
+                $merged += ('[DSH] ' + [string]$snap.message)
+                $merged += ('[pi] ' + [string]$piSnap.message)
+            }
+            # 【不原地改快照】$snap 常是某个源的节流缓存对象（主脚本 1s / pi 源 2s 都原样
+            # 返回缓存）。过去直接写 $snap.progressLines/message/toolCount，把合并结果写进
+            # 缓存：下一帧再合并一次就变成 [DSH] [DSH] …，气泡每 500ms 变宽一次 = 闪。
+            # 合并产物必须全部放进新哈希表，任何源的缓存保持只读。
+            $toolSum = 0
+            try { $toolSum = [int]$snap.toolCount + [int]$piSnap.toolCount } catch { $toolSum = [int]$snap.toolCount }
+            $lastToolValue = $null
+            try { if ($snap.lastTool) { $lastToolValue = [string]$snap.lastTool } } catch { }
+            if (-not $lastToolValue) { try { if ($piSnap.lastTool) { $lastToolValue = [string]$piSnap.lastTool } } catch { } }
+            $snap = @{
+                mode          = [string]$snap.mode
+                seq           = [int]$snap.seq
+                source        = 'harness'
+                combinedSource = 'dsh+pi'
+                message       = ('{0} 个任务进行中（DSH + pi）' -f ([int]$snap.runningAgents + [int]$piSnap.runningAgents))
+                progressLines = @($merged)
+                toolCount     = $toolSum
+                lastTool      = $lastToolValue
+            }
         } elseif ($piRunning -and -not $dshRunning) {
             $snap = $piSnap; $agentSource = 'pi'
         } elseif ($dshRunning) { $agentSource = 'dsh' }
@@ -122,6 +145,63 @@ try {
     CheckTrue '第 1 行带 [DSH] 前缀' ($snap.progressLines[0] -match '^\[DSH\]')
     CheckTrue '第 2 行带 [pi] 前缀'  ($snap.progressLines[1] -match '^\[pi\]')
     CheckTrue 'message 说明两边都在跑' ($snap.message -match 'DSH \+ pi')
+
+    # ---- 3b. 连续帧合并不得污染节流缓存（回归：曾经的 500ms 一闪一闪）----
+    Write-Host ""
+    Write-Host "=== 3b. 连续帧重复合并不污染缓存 ===" -ForegroundColor Cyan
+    # 模拟主脚本的真实节流行为：Get-StateFromHarness 1 秒节流「原样返回同一个缓存对象」，
+    # pi 源 2 秒节流同样。若仲裁继续原地改快照，第二帧起 progressLines 会出现 [DSH] [DSH]。
+    $dshCache = @{
+        mode = 'working'; source = 'harness'; message = '进行中：改支付模块'
+        progressLines = @('正在处理：改支付模块 · 1 轮 / 2 步')
+        waiting = $false; runningAgents = 1; toolCount = 2; lastTool = 'edit'
+        completedAt = 0; lastSummary = $null
+    }
+    function Get-DshThrottled { return $script:dshCache }   # 模拟节流：总是同一个对象
+    $snapFrame1 = $null; $snapFrame2 = $null; $snapFrame3 = $null
+    foreach ($frame in 1..3) {
+        $snapF = Get-DshThrottled
+        $agentSourceF = 'dsh'
+        $piSnapF = $piSnap   # 来自夹具的 working 快照（沿用上面真实模块的输出）
+        if ($null -ne $snapF -and $null -ne $piSnapF) {
+            $dshRunningF = ($snapF.mode -eq 'working' -or $snapF.mode -eq 'review')
+            $piRunningF = ($piSnapF.mode -eq 'working' -or $piSnapF.mode -eq 'review')
+            if ($dshRunningF -and $piRunningF) {
+                $agentSourceF = 'dsh+pi'
+                $mergedF = @()
+                foreach ($l in @($snapF.progressLines)) { if ($l) { $mergedF += ('[DSH] ' + ([string]$l -replace '^·\s*', '')) } }
+                foreach ($l in @($piSnapF.progressLines)) {
+                    if ($l -and ([string]$l -notmatch '(^| )\[pi\]')) { $mergedF += ('[pi] ' + ([string]$l -replace '^·\s*', '')) }
+                    elseif ($l) { $mergedF += ([string]$l -replace '^·\s*', '') }
+                }
+                if ($mergedF.Count -eq 0) {
+                    $mergedF += ('[DSH] ' + [string]$snapF.message)
+                    $mergedF += ('[pi] ' + [string]$piSnapF.message)
+                }
+                $toolSumF = 0
+                try { $toolSumF = [int]$snapF.toolCount + [int]$piSnapF.toolCount } catch { $toolSumF = [int]$snapF.toolCount }
+                $lastToolValueF = $null
+                try { if ($snapF.lastTool) { $lastToolValueF = [string]$snapF.lastTool } } catch { }
+                if (-not $lastToolValueF) { try { if ($piSnapF.lastTool) { $lastToolValueF = [string]$piSnapF.lastTool } } catch { } }
+                $snapF = @{
+                    mode          = [string]$snapF.mode
+                    seq           = [int]$snapF.seq
+                    source        = 'harness'
+                    combinedSource = 'dsh+pi'
+                    message       = ('{0} 个任务进行中（DSH + pi）' -f ([int]$snapF.runningAgents + [int]$piSnapF.runningAgents))
+                    progressLines = @($mergedF)
+                    toolCount     = $toolSumF
+                    lastTool      = $lastToolValueF
+                }
+            }
+        }
+        switch ($frame) { 1 { $snapFrame1 = $snapF } 2 { $snapFrame2 = $snapF } 3 { $snapFrame3 = $snapF } }
+    }
+    Check '第 2 帧与第 1 帧完全一致（缓存未被污染）' (($snapFrame2.progressLines -join '§')) (($snapFrame1.progressLines -join '§'))
+    Check '第 3 帧与第 1 帧完全一致' (($snapFrame3.progressLines -join '§')) (($snapFrame1.progressLines -join '§'))
+    CheckTrue '缓存对象本身未被改写' ([string]$script:dshCache.progressLines[0] -eq '正在处理：改支付模块 · 1 轮 / 2 步')
+    CheckTrue '没有出现双层前缀' (-not (($snapFrame3.progressLines -join '§') -match '\[DSH\] \[DSH\]'))
+    CheckTrue '没有重复的 [pi] 前缀' (-not (($snapFrame3.progressLines -join '§') -match '\[pi\].*\[pi\]'))
 
     # ---- 4. pi 在等（扩展通道）优先于 DSH 在跑 ----
     Write-Host ""

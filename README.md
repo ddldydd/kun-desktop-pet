@@ -542,6 +542,11 @@ Copy-Item .\pi-extension\kun-pet.ts $dest -Force
 
 底部来源会写成「Harness 实时 + pi」。**任一侧在等你，都立刻喊人**（横幅会写明是 DSH 还是 pi）。
 
+> v2.4.7 修过一个此场景独有的「一闪一闪」：仲裁分支曾把并列合并的结果**原地写回快照**，
+> 而快照往往是某个源的**节流缓存对象**（DSH 会话扫描 1 秒 / pi 会话尾随 2 秒都原样返回缓存）。
+> 每 500ms 轮询都把合并结果再叠一层，`[DSH]` 逐帧累积成 `[DSH] [DSH] …`，气泡每 500ms
+> 变宽一次 = 肉眼可见的一闪一闪。现在合并产物写在全新哈希表里，任何源的缓存保持只读。
+
 ### 开关
 
 右键菜单 → **「兼容 pi coding agent」**（带勾选，持久化到 `kun-pet-settings.json` 的 `piEnabled`）。关掉后桌宠完全不理 pi。
@@ -590,7 +595,7 @@ Copy-Item .\pi-extension\kun-pet.ts $dest -Force
 # 1) 纯逻辑 + 夹具（66 项）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-source.ps1
 
-# 2) 接入与多源仲裁（31 项）：dot-source、并列显示、等待优先、过期快照、开关
+# 2) 接入与多源仲裁（36 项）：dot-source、并列显示、连续帧不污染缓存、等待优先、过期快照、开关
 powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-integration.ps1
 
 # 3) 拿本机**真实**的 ~/.pi/agent/sessions 跑一遍（只读）
