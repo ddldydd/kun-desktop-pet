@@ -1,4 +1,4 @@
-<#
+﻿<#
   Kun Like 桌宠 · 桌面版 v2（对齐 Codex / petdex 桌宠规格）
 
   对齐的 Codex 桌宠功能：
@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.7'
+    Version     = '2.4.8'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -617,6 +617,13 @@ $state = [hashtable]::Synchronized(@{
     questionApprove = ''
     gapPx = -18
     floating = $true
+    # ---- 气泡（信息框）配色 ----
+    # bubbleTheme: 'light' 浅色(默认) / 'dark' 深色(深底白字) / 'system' 跟随系统 / 'custom' 自定义
+    # bubbleBg / bubbleFg: custom 时的底色与文字色（#RRGGBB 或 #AARRGGBB；bubbleFg 留空 = 按底色自动配）
+    # 配色只改气泡（信息框），不动小宠形象本身 —— 用户要的是「信息框换个颜色」。
+    bubbleTheme = 'light'
+    bubbleBg = ''
+    bubbleFg = ''
     # ---- 随机移动（到处跑）----
     # wanderEnabled: 是否让小宠自己在桌面上溜达（右键菜单开关，持久化）
     # 默认**关**：宠物自己会动是有打扰性的，必须由用户主动开启。
@@ -852,6 +859,77 @@ $script:brushWaitQuestionBorder = [System.Windows.Media.Brush][System.Windows.Me
 $script:brushWaitApproval = [System.Windows.Media.Brush][System.Windows.Media.BrushConverter]::new().ConvertFromString('#FFE8F6EA')
 $script:brushWaitApprovalBorder = [System.Windows.Media.Brush][System.Windows.Media.BrushConverter]::new().ConvertFromString('#FF4CAF50')
 $script:bubbleTint = ''
+
+# ---------------- 气泡（信息框）配色 ----------------
+# 需求：信息框颜色要能改 —— 例如换成深色面板那种「深底 + 白字」。
+# 调色板的计算放在 kun-pet-ui.ps1（纯函数、可脱离桌宠自测），这里只负责：
+# 颜色字符串 → WPF 画刷 → 贴到控件上，并保证「等待提示色」跟着主题一起换。
+function ConvertTo-BubbleBrush([string]$hex) {
+    if (-not $hex) { return $null }
+    try { return [System.Windows.Media.Brush][System.Windows.Media.BrushConverter]::new().ConvertFromString($hex) }
+    catch { return $null }
+}
+
+# 菜单勾选：菜单在 Load-Settings 之前建，所以这里必须能容错（早调用不报错）
+function Update-BubbleMenuChecks {
+    try {
+        if (-not $script:bubbleItems) { return }
+        foreach ($key in @($script:bubbleItems.Keys)) {
+            $script:bubbleItems[$key].Checked = ([string]$state.bubbleTheme -eq [string]$key)
+        }
+    } catch { }
+}
+
+function Apply-BubbleTheme([bool]$persist) {
+    try {
+        if (-not (Get-Command -Name 'Get-BubblePalette' -CommandType Function -ErrorAction SilentlyContinue)) {
+            Write-Log 'bubble theme skipped: kun-pet-ui.ps1 helpers missing'
+            return
+        }
+        $pal = Get-BubblePalette ([string]$state.bubbleTheme) ([string]$state.bubbleBg) ([string]$state.bubbleFg)
+        if (-not $pal) { return }
+
+        # 先换「每帧都会用到」的原色与等待色：tint 切换时读的就是这几个变量
+        $bBg = ConvertTo-BubbleBrush $pal.bg
+        $bBorder = ConvertTo-BubbleBrush $pal.border
+        $bText = ConvertTo-BubbleBrush $pal.text
+        $bSub = ConvertTo-BubbleBrush $pal.sub
+        $bHint = ConvertTo-BubbleBrush $pal.hint
+        $bWq = ConvertTo-BubbleBrush $pal.waitQuestion
+        $bWqB = ConvertTo-BubbleBrush $pal.waitQuestionBorder
+        $bWa = ConvertTo-BubbleBrush $pal.waitApproval
+        $bWaB = ConvertTo-BubbleBrush $pal.waitApprovalBorder
+        if ($bBg) { $script:brushBubble = $bBg }
+        if ($bBorder) { $script:brushBubbleBorder = $bBorder }
+        if ($bWq) { $script:brushWaitQuestion = $bWq }
+        if ($bWqB) { $script:brushWaitQuestionBorder = $bWqB }
+        if ($bWa) { $script:brushWaitApproval = $bWa }
+        if ($bWaB) { $script:brushWaitApprovalBorder = $bWaB }
+
+        # 立刻按「当前是否在等用户」重画一次，不等下一帧（等待中要保留等待色）
+        $tint = [string]$script:bubbleTint
+        $bgNow = $script:brushBubble
+        $borderNow = $script:brushBubbleBorder
+        if ($tint -eq 'approval') { $bgNow = $script:brushWaitApproval; $borderNow = $script:brushWaitApprovalBorder }
+        elseif ($tint -eq 'question') { $bgNow = $script:brushWaitQuestion; $borderNow = $script:brushWaitQuestionBorder }
+        $bubbleEl.Background = $bgNow
+        $bubbleEl.BorderBrush = $borderNow
+        $bubbleTailEl.Fill = $bgNow
+        $bubbleTailEl.Stroke = $borderNow
+        # tint 缓存清空：否则下一帧会认为「配色标签没变」而跳过重画（切主题时正好卡在这里）
+        $script:bubbleTint = $null
+
+        if ($bText) { $bubbleTextEl.Foreground = $bText }
+        if ($bSub) { $progressTextEl.Foreground = $bSub }
+        if ($bHint) { $hintTextEl.Foreground = $bHint }
+
+        Update-BubbleMenuChecks
+        Write-Log ('bubble theme: {0} · bg={1} · text={2}' -f [string]$state.bubbleTheme, [string]$pal.bg, [string]$pal.text)
+        if ($persist) { Save-Settings }
+    } catch {
+        Note-TickError 'apply-bubble-theme' $_
+    }
+}
 
 function Update-VectorLook([string]$action) {
     try {
@@ -1862,6 +1940,10 @@ function Save-Settings {
             # 随机移动：默认关，同样用「字段是否存在」判断（见 Load-Settings）
             wander = [bool]$state.wanderEnabled
             animSpeed = $state.animSpeed
+            # 气泡配色：主题 + 自定义色（custom 才用到后两项，存着方便下次改回来）
+            bubbleTheme = [string]$state.bubbleTheme
+            bubbleBg = [string]$state.bubbleBg
+            bubbleFg = [string]$state.bubbleFg
             posLeft = [double]$window.Left
             posTop  = [double]$window.Top
             # 窗口是 SizeToContent：尺寸随气泡文字变，只存左上角的话，
@@ -1926,6 +2008,16 @@ function Load-Settings {
             $gp = [int]$saved.gapPx
             if ($gp -ge -32 -and $gp -le 0) { $state.gapPx = $gp }
         }
+        # 气泡配色：主题非法时保持默认（浅色），不写半套配置。
+        # 刻意放在最前面几项里：Load-Settings 是**整段 try**，中间任何一处抛异常都会让
+        # 后面所有字段读不进来（animSpeed 的坏重载就坑过位置恢复），配色不能跟着陪葬。
+        if ($null -ne $saved.bubbleTheme) {
+            $bt = ([string]$saved.bubbleTheme).Trim().ToLowerInvariant()
+            if ($bt -eq 'light' -or $bt -eq 'dark' -or $bt -eq 'system' -or $bt -eq 'custom') { $state.bubbleTheme = $bt }
+        }
+        # 自定义色原样存回字符串，合法性交给 Get-BubblePalette 判断（看不懂就按默认）
+        if ($null -ne $saved.bubbleBg) { $state.bubbleBg = [string]$saved.bubbleBg }
+        if ($null -ne $saved.bubbleFg) { $state.bubbleFg = [string]$saved.bubbleFg }
         if ($saved.multiMode) {
             $mm = [string]$saved.multiMode
             if ($mm -eq 'all' -or $mm -eq 'rotate' -or $mm -eq 'single') { $state.multiTaskMode = $mm }
@@ -1953,7 +2045,14 @@ function Load-Settings {
             if ($as -eq 'still') { $state.animSpeed = 'still' }
             else {
                 $asn = 0.0
-                if ([double]::TryParse([string]$as, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$asn)) {
+                # 【v2.4.8 修】原来写的是 TryParse(string, IFormatProvider, out double) —— 没有这个重载，
+                # 于是每次带 animSpeed 的配置都会抛「找不到 TryParse 的重载」，被下面的 catch 吞掉：
+                # 表现为 Load-Settings 读到一半中断，**后面的位置与气泡配色全部读不进来**（桌宠每次启动回默认位置）。
+                # 正确写法是 4 参数的 TryParse(string, NumberStyles, IFormatProvider, out double)。
+                if ([double]::TryParse([string]$as,
+                        [System.Globalization.NumberStyles]::Float,
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [ref]$asn)) {
                     if ($asn -ge 0.25 -and $asn -le 4) { $state.animSpeed = $asn }
                 }
             }
@@ -2366,6 +2465,73 @@ $miGapFarther = [System.Windows.Forms.ToolStripMenuItem]::new('更远（快捷�
 $miGapFarther.add_Click({ Set-Gap ([int]$state.gapPx + 3) $true })
 $gapMenu.DropDownItems.Add($miGapFarther) | Out-Null
 $menu.Items.Add($gapMenu) | Out-Null
+
+# 气泡（信息框）配色：默认浅色；想要深色面板那种「深底 + 白字」直接选「深色」。
+# 只调气泡的底色/文字色，不动小宠形象（形象是素材决定的）。
+# 等待提示（提问=琥珀 / 审批=绿）会跟着主题换成同色系的暗底，不会闪回一块白底。
+$bubbleMenu = [System.Windows.Forms.ToolStripMenuItem]::new('气泡配色')
+$script:bubbleItems = @{}
+$script:bubblePresets = @(
+    @{ label = '浅色（白底黑字）'; value = 'light' },
+    @{ label = '深色（深底白字）'; value = 'dark' },
+    @{ label = '跟随系统';         value = 'system' }
+)
+foreach ($preset in $script:bubblePresets) {
+    $bubbleValue = [string]$preset.value
+    $item = [System.Windows.Forms.ToolStripMenuItem]::new([string]$preset.label)
+    $item.Tag = $bubbleValue
+    $item.add_Click({
+        param($sender, $eventArgs)
+        $state.bubbleTheme = [string]$sender.Tag
+        Apply-BubbleTheme $true
+    })
+    $script:bubbleItems[$bubbleValue] = $item
+    $bubbleMenu.DropDownItems.Add($item) | Out-Null
+}
+$bubbleMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+$miBubbleCustom = [System.Windows.Forms.ToolStripMenuItem]::new('自定义颜色…')
+$miBubbleCustom.add_Click({
+    try {
+        $suggest = [string]$state.bubbleBg
+        if (-not $suggest) { $suggest = '#FF1F1F1F' }
+        $text = "输入气泡底色（#RRGGBB 或 #AARRGGBB）。" + [Environment]::NewLine +
+                "想一起定文字色就写成「底色,文字色」，例如 #1F1F1F,#FFFFFF。" + [Environment]::NewLine +
+                "只填底色 = 文字色按底色深浅自动配（深底自动白字）。"
+        $input = [Microsoft.VisualBasic.Interaction]::InputBox($text, '自定义气泡颜色', $suggest)
+        if (-not $input) { return }
+        $parts = @(([string]$input).Split([char[]]@(',', ';', ' '), [System.StringSplitOptions]::RemoveEmptyEntries))
+        if ($parts.Count -eq 0) { return }
+        $bg = Convert-BubbleColor $parts[0]
+        if (-not $bg) {
+            [System.Windows.Forms.MessageBox]::Show('颜色看不懂，请用 #RRGGBB 或 #AARRGGBB，例如 #1F1F1F。', '自定义气泡颜色') | Out-Null
+            return
+        }
+        $fg = ''
+        if ($parts.Count -ge 2) {
+            $fg = Convert-BubbleColor $parts[1]
+            if (-not $fg) {
+                [System.Windows.Forms.MessageBox]::Show('文字色看不懂，请用 #RRGGBB 或 #AARRGGBB；留空则自动配对比色。', '自定义气泡颜色') | Out-Null
+                return
+            }
+        }
+        $state.bubbleTheme = 'custom'
+        $state.bubbleBg = [string]$bg
+        $state.bubbleFg = [string]$fg
+        Apply-BubbleTheme $true
+    } catch {
+        Note-TickError 'bubble-custom' $_
+    }
+})
+$bubbleMenu.DropDownItems.Add($miBubbleCustom) | Out-Null
+
+$miBubbleReset = [System.Windows.Forms.ToolStripMenuItem]::new('恢复默认（浅色）')
+$miBubbleReset.add_Click({
+    $state.bubbleTheme = 'light'
+    Apply-BubbleTheme $true
+})
+$bubbleMenu.DropDownItems.Add($miBubbleReset) | Out-Null
+$menu.Items.Add($bubbleMenu) | Out-Null
 
 # 多任务展示菜单：多会话并行时气泡里怎么展示进展（全部 / 轮换 / 单条）
 $multiMenu = [System.Windows.Forms.ToolStripMenuItem]::new('多任务展示')
@@ -3086,6 +3252,8 @@ Apply-Scale
 Apply-Gap
 Update-GapMenuChecks
 Update-MultiMenuChecks
+# 气泡配色：勾选状态 + 实际贴色都要跟着设置走（菜单在 Load-Settings 之前建的）
+Apply-BubbleTheme $false
 if ($state.paused) { $miPause.Text = '继续' }
 $miFloat.Checked = [bool]$state.floating
 # pi 开关的勾选状态要跟着设置走（菜单是在 Load-Settings 之前建的）

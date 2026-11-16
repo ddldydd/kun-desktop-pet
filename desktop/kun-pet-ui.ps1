@@ -64,3 +64,151 @@ function Resolve-BubbleVisibility([bool]$worth, $idleSince, $now, [int]$graceMs 
     try { $visible = (($now - $since).TotalMilliseconds -lt $graceMs) } catch { $visible = $true }
     return @{ visible = $visible; idleSince = $since }
 }
+
+# =====================================================================
+#  气泡（信息框）配色
+# =====================================================================
+#  需求：信息框颜色要能改 —— 比如换成「系统深色面板那种深底 + 白字」。
+#
+#  这里只做**纯字符串计算**（不碰 WPF 对象），好处与上面几个函数相同：
+#  能脱离桌宠单独自测（tests/test-bubble-theme.ps1 直接调它）。
+#  真正的画刷（Brush）在 kun-pet-desktop.ps1 的 Apply-BubbleTheme 里创建。
+#
+#  主题：
+#    light  浅色（历来默认：半透明白底 + 深灰字）
+#    dark   深色（深灰底 + 白字，接近 Windows 深色模式的面板）
+#    system 跟随系统（读 HKCU\...\Themes\Personalize\AppsUseLightTheme）
+#    custom 自定义（底色手填；文字色可手填，留空则按底色亮度自动配对比色）
+
+# 把用户输入的颜色规整成 '#AARRGGBB'；看不懂就返回 $null。
+# 绝不抛异常：菜单里输入的值直接进这里，抛异常会让菜单点击无声失败。
+# 接受 #RGB / #RRGGBB / #AARRGGBB，带不带 '#' 都行，大小写随意。
+function Convert-BubbleColor([string]$spec) {
+    $s = [string]$spec
+    if (-not $s) { return $null }
+    $s = $s.Trim()
+    if ($s.StartsWith('#')) { $s = $s.Substring(1) }
+    if ($s.Length -eq 3) {
+        $expanded = ''
+        foreach ($ch in $s.ToCharArray()) { $expanded = $expanded + [string]$ch + [string]$ch }
+        $s = $expanded
+    }
+    if ($s.Length -eq 6) { $s = 'FF' + $s }
+    if (-not ($s -match '^[0-9A-Fa-f]{8}$')) { return $null }
+    return ('#' + $s.ToUpperInvariant())
+}
+
+# 取 RGB 分量（忽略 alpha：判断明暗时 alpha 不参与）
+function Get-BubbleColorRgb([string]$hex) {
+    $c = Convert-BubbleColor $hex
+    if (-not $c) { return $null }
+    return @{
+        r = [Convert]::ToInt32($c.Substring(3, 2), 16)
+        g = [Convert]::ToInt32($c.Substring(5, 2), 16)
+        b = [Convert]::ToInt32($c.Substring(7, 2), 16)
+    }
+}
+
+# 底色是不是「暗色」。阈值 0.5：用的感知亮度加权（绿最亮、蓝最暗），
+# 比简单平均更贴近肉眼感受（纯红 #FF0000 会被判成暗色，白字压在红底上确实更清楚）。
+function Get-BubbleColorIsDark([string]$hex) {
+    $rgb = Get-BubbleColorRgb $hex
+    if (-not $rgb) { return $false }
+    $lum = (0.2126 * $rgb.r + 0.7152 * $rgb.g + 0.0722 * $rgb.b) / 255.0
+    return ($lum -lt 0.5)
+}
+
+# Windows 当前是深色还是浅色（应用主题，不是任务栏主题）。
+# 读不到注册表就按浅色：旧版本一直用浅色，不能因为读失败就突然变成深色。
+function Get-SystemThemeIsDark {
+    try {
+        $p = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+        if ($null -ne $p.AppsUseLightTheme) { return ([int]$p.AppsUseLightTheme -eq 0) }
+    } catch { }
+    return $false
+}
+
+# 把前景色按权重混到底色里（0.72 = 前景七成、底色三成）。
+# 用于从「底色 + 文字色」自动派生出二级文字（进展行）与底部提示的颜色，
+# 自定义配色时不用让用户填四五种颜色。
+function Get-MixedBubbleColor([string]$fg, [string]$bg, [double]$fgWeight) {
+    $a = Get-BubbleColorRgb $fg
+    $b = Get-BubbleColorRgb $bg
+    if (-not $a) { return $fg }
+    if (-not $b) { return $fg }
+    $w = [double]$fgWeight
+    if ($w -lt 0) { $w = 0 }
+    if ($w -gt 1) { $w = 1 }
+    $r = [int][math]::Round($a.r * $w + $b.r * (1 - $w))
+    $g = [int][math]::Round($a.g * $w + $b.g * (1 - $w))
+    $bl = [int][math]::Round($a.b * $w + $b.b * (1 - $w))
+    return ('#FF{0:X2}{1:X2}{2:X2}' -f $r, $g, $bl)
+}
+
+# 两套内置调色板。
+# 等待提示（提问=琥珀 / 审批=绿）也要跟着主题走：浅色主题用浅底，
+# 深色主题用同色系的暗底，否则深色气泡一进等待状态就突然闪回一块白底。
+function New-BubblePalette([bool]$dark) {
+    if ($dark) {
+        return @{
+            dark                = $true
+            bg                  = '#F21F1F1F'
+            border              = '#33FFFFFF'
+            text                = '#FFFFFFFF'
+            sub                 = '#FFC0C0C0'
+            hint                = '#FF9A9A9A'
+            waitQuestion        = '#F2433014'
+            waitQuestionBorder  = '#FFE0A64B'
+            waitApproval        = '#F2183320'
+            waitApprovalBorder  = '#FF4CAF50'
+        }
+    }
+    return @{
+        dark                = $false
+        bg                  = '#F5FFFFFF'
+        border              = '#1A000000'
+        text                = '#FF333333'
+        sub                 = '#FF888888'
+        hint                = '#FF666666'
+        waitQuestion        = '#FFFFF4DC'
+        waitQuestionBorder  = '#FFE0A64B'
+        waitApproval        = '#FFE8F6EA'
+        waitApprovalBorder  = '#FF4CAF50'
+    }
+}
+
+# 主题名 + 自定义色 → 一份完整的调色板（全是 '#AARRGGBB' 字符串）。
+function Get-BubblePalette([string]$theme, [string]$customBg = '', [string]$customText = '') {
+    $t = ([string]$theme)
+    if ($t) { $t = $t.Trim().ToLowerInvariant() } else { $t = 'light' }
+    if ($t -eq 'system') {
+        if (Get-SystemThemeIsDark) { $t = 'dark' } else { $t = 'light' }
+    }
+
+    if ($t -eq 'custom') {
+        $bg = Convert-BubbleColor $customBg
+        # 底色填错/没填：按深色处理 —— 用户点「自定义」通常就是嫌白底刺眼，
+        # 退回浅色会让这次点击看起来像没生效。
+        if (-not $bg) { $bg = '#F21F1F1F' }
+        $dark = Get-BubbleColorIsDark $bg
+        $fg = Convert-BubbleColor $customText
+        if ($fg) {
+            # 自填了近色（文字和底色一样深/一样浅）时强制换成对比色，否则字看不清
+            if ((Get-BubbleColorIsDark $fg) -eq $dark) {
+                if ($dark) { $fg = '#FFFFFFFF' } else { $fg = '#FF111111' }
+            }
+        } else {
+            if ($dark) { $fg = '#FFFFFFFF' } else { $fg = '#FF1A1A1A' }
+        }
+        $pal = New-BubblePalette $dark
+        $pal.bg = $bg
+        $pal.text = $fg
+        if ($dark) { $pal.border = '#33FFFFFF' } else { $pal.border = '#1A000000' }
+        $pal.sub = Get-MixedBubbleColor $fg $bg 0.72
+        $pal.hint = Get-MixedBubbleColor $fg $bg 0.50
+        return $pal
+    }
+
+    if ($t -eq 'dark') { return (New-BubblePalette $true) }
+    return (New-BubblePalette $false)
+}

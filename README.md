@@ -226,6 +226,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveAsset
 判定是纯函数 `Resolve-BubbleVisibility`（在 `desktop/kun-pet-ui.ps1` 里），
 `tests/test-notice.ps1` 直接测它。
 
+### 气泡配色可改（v2.4.8）
+
+信息框（气泡）的颜色可以换。右键菜单 **「气泡配色」**：
+
+| 菜单项 | 效果 |
+|---|---|
+| **浅色（白底黑字）** | 历来默认：半透明白底 + 深灰字；「恢复默认（浅色）」回到它 |
+| **深色（深底白字）** | 深灰底（`#F21F1F1F`）+ 白字，接近 Windows 深色面板那种系统观感 |
+| **跟随系统** | 读 `HKCU\...\Themes\Personalize\AppsUseLightTheme`：系统深色就深色、浅色就浅色（读不到按浅色，不会因为读失败突然变脸） |
+| **自定义颜色…** | 填底色 `#RRGGBB` / `#AARRGGBB`；想一起定文字色就写「底色,文字色」（例 `#1F1F1F,#FFFFFF`） |
+
+- 只填底色时**按底色亮度自动配对比色**：深底自动白字、浅底自动深字；
+  填了近色（字和底一样深 / 一样浅）会被强制换成看得清的对比色；
+- 进展行（`· 修登录 bug`）与底部提示由文字色按比例混到底色里派生，不会黑字压黑底；
+- **等待提示也跟着主题走**：提问 = 琥珀、审批 = 绿；深色主题用同色系暗底，
+  切主题的瞬间不会闪回一块白底；
+- 配色写进 `kun-pet-settings.json` 的 `bubbleTheme` / `bubbleBg` / `bubbleFg`，下次启动原样恢复；
+- 只改信息框，**不动小宠形象**（形象是素材决定的）。
+
+配色规则全是纯函数（`Convert-BubbleColor` / `Get-BubblePalette` / `Get-MixedBubbleColor` …，
+在 `desktop/kun-pet-ui.ps1`），`desktop/tests/test-bubble-theme.ps1` 直接测它们；
+颜色字符串 → 画刷的落地在 `Apply-BubbleTheme`。
+
 ### 气泡与底部提示不闪（v2.4.5）
 
 早期版本底部标签会在「Harness 实时」与「会话活跃度（兜底）」之间翻转、
@@ -283,6 +306,7 @@ watchdog: cleared stuck menuOpen (menu not visible)
 | **动作** | 手动切到 9 个标准动作中的任意一个（用于预览素材） |
 | **大小** | 8 档预设（25%–300%）、放大 / 缩小（±10%）、自定义…（25–300） |
 | **间距** | 气泡与宠物之间的距离（`gapPx`） |
+| **气泡配色** | 信息框的底色/文字色：浅色（白底黑字）/ 深色（深底白字）/ 跟随系统 / 自定义颜色…（见上文「气泡配色可改」） |
 | **多任务展示** | 全部展示 / 轮换展示（2s / 4s / 8s）/ 仅展示最活跃任务 |
 | **暂停** | 冻结/恢复小宠动画（提示照常） |
 | **浮动动画** | 待机时的上下浮动 / 呼吸效果 |
@@ -635,6 +659,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-sour
 | `scale` | 缩放比例（0.25–3.0） |
 | `posLeft` / `posTop` / `posW` / `posH` | 窗口位置与尺寸（按「底边 + 水平中心」还原，夹在工作区内） |
 | `gapPx` | 气泡与宠物的间距 |
+| `bubbleTheme` | 气泡配色主题：`light`（默认）/ `dark` / `system`（跟随系统）/ `custom` |
+| `bubbleBg` / `bubbleFg` | `custom` 时的底色与文字色（`#RRGGBB` / `#AARRGGBB`；`bubbleFg` 空 = 按底色自动配对比色） |
 | `multiMode` / `rotateSec` | 多任务展示方式 / 轮换间隔秒数 |
 | `piEnabled` | 是否跟随 pi coding agent（默认 `true`；右键菜单可切换） |
 | `wander` | 是否让宠物自己在桌面上到处跑（默认 `false`；右键菜单可切换） |
