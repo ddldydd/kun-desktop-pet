@@ -1,6 +1,6 @@
 ﻿# 终极验证：用**真实 GitHub 源**跑一次完整的「检查更新」决策流程。
 # 手法：复制当前 live 桌宠到临时目录，把它的版本号改成一个更旧的（2.0.0），
-#      然后调用 Invoke-PetUpdate —— 它应该真的从 GitHub 下载并更新到 2.1.0。
+#      然后调用 Invoke-PetUpdate —— 它应该真的从 GitHub 下载并更新到「远端最新版」。
 # 全程在临时目录，不碰用户正在跑的桌宠。
 $live = $args[0]
 $ErrorActionPreference = 'Continue'
@@ -51,7 +51,7 @@ Write-Host ""
 Write-Host "=== 结果核对 ==="
 $after = Get-Content $localVj -Raw -Encoding UTF8
 Write-Host ("更新后 本地 version.json: " + $after.Trim())
-Write-Host ("  版本已变成 2.1.0 : " + ($after -match '2\.1\.0'))
+Write-Host ("  版本已变成远端版本 " + $r.remoteVersion + " : " + (((($after | ConvertFrom-Json).version) -eq [string]$r.remoteVersion)))
 Write-Host ("  旧标记已被覆盖掉   : " + (-not ([IO.File]::ReadAllText($marker, [Text.Encoding]::UTF8).Contains('I-AM-OLD-MARKER'))))
 # 落盘的文件必须仍是可解析的脚本（BOM 保留）
 $errs = $null
@@ -62,6 +62,8 @@ Write-Host ("  更新后仍有 BOM     : " + ($b[0] -eq 0xEF -and $b[1] -eq 0xBB
 Write-Host ("  备份里是旧内容     : " + ([IO.File]::ReadAllText((Join-Path $r.backupDir 'kun-pet-pi-source.ps1'), [Text.Encoding]::UTF8).Contains('I-AM-OLD-MARKER')))
 Write-Host ""
 Write-Host "=== 再跑一次：应判定「已是最新」，不再改动 ==="
-$r2 = Invoke-PetUpdate $tmp '2.1.0' $tmp
+# 传**真实**的当前版本（上一轮刚更新成的那个），否则永远会判定「有新版本」——
+# 这里以前硬编码成 2.1.0，远端早就不是 2.1.0 了，于是这一行永远显示 updated（误导）。
+$r2 = Invoke-PetUpdate $tmp ([string]$r.remoteVersion) $tmp
 Write-Host ("  状态: " + $r2.status + "（期望 up-to-date）")
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
