@@ -32,7 +32,7 @@
 
 ## 这是什么
 
-仓库里一共三部分，**可以只用第一部分**：
+仓库里一共四部分，**可以只用第一部分**：
 
 | 目录 | 内容 | 需要 DSH 吗 |
 |---|---|---|
@@ -287,7 +287,7 @@ watchdog: cleared stuck menuOpen (menu not visible)
 
 | 操作 | 以前的症状 | 现在 |
 |---|---|---|
-| 一键更新 | 下载 / 校验 / 替换 11 个文件在 UI 线程同步跑（注释写着「丢后台」其实没丢），更新全程桌宠不动 | 真正移到后台 runspace，更新期间气泡照常刷新、可点击 |
+| 一键更新 | 下载 / 校验 / 替换 12 个文件在 UI 线程同步跑（注释写着「丢后台」其实没丢），更新全程桌宠不动 | 真正移到后台 runspace，更新期间气泡照常刷新、可点击 |
 | 点「✓ 同意 / ✗ 拒绝」 | 审批 POST 同步等（原超时 2 秒），点了就没反应 | 后台 runspace，UI 线程零阻塞 |
 | 「创建桌面快捷方式」 | `WaitForExit` 同步等子进程 | 同上 |
 
@@ -409,7 +409,9 @@ New-Item -ItemType Junction -Path $link -Target $store | Out-Null
 重启后自查：
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | Select-Object mode, updatedAt
+# 端点地址由插件写在 ~/.dsh/kun-pet-endpoint.json 里，端口随 DSH 变化（不是固定的 19387）
+$ep = (Get-Content "$env:USERPROFILE\.dsh\kun-pet-endpoint.json" -Raw | ConvertFrom-Json).url
+Invoke-RestMethod $ep | Select-Object mode, updatedAt
 ```
 
 看到 JSON（而不是 404）就对了。插件自己的日志在 `~/.dsh/kun-pet-host.log`。
@@ -439,7 +441,7 @@ Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | Select-Object mode, upd
 右键托盘图标 → **「检查更新…」**：
 
 1. 自动对比当前版本与最新版本（只下载一个极小的 `version.json`）
-2. **已是最新** → 小宠的**气泡**会告诉你「✅ 已是最新版本（当前 v2.4.3）/ 无需更新」，约 8 秒后自动消失
+2. **已是最新** → 小宠的**气泡**会告诉你「✅ 已是最新版本（当前 v2.4.9）/ 无需更新」，约 8 秒后自动消失
 3. **有新版本** → 弹窗列出**本次更新内容**，你点「是」才继续
 4. 更新过程中：先把所有文件下载到临时位置并**逐个校验**，全部通过后才替换
 5. 完成后自动重启桌宠应用新版本
@@ -448,7 +450,7 @@ Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | Select-Object mode, upd
 > 会落在桌宠下面、可能被挡住，还会抢焦点打断你打字。气泡贴在置顶的小宠上，
 > 一定看得见，也完全不打扰你。（要替换文件这种不可逆操作仍会弹窗确认。）
 
-当前版本号显示在气泡**底部**（如 `Harness 实时 · v2.4.3 · 已 3s`），随时能看到。
+当前版本号显示在气泡**底部**（如 `Harness 实时 · v2.4.9 · 已 3 分`），随时能看到。
 
 ### 更新是安全的（这些都有测试覆盖）
 
@@ -469,6 +471,18 @@ Invoke-RestMethod http://127.0.0.1:19387/kun-pet/state | Select-Object mode, upd
 > 所以更新后双击它照常启动、读的是同一份配置。
 
 > 如果更新后桌宠起不来：进 `backup-v<版本>-<时间戳>/` 目录，把里面的文件覆盖回桌宠目录即可。
+
+### 更新 / 启动会自动修复 DSH 插件通道（v2.4.9）
+
+DSH 升级或资料同步有时会把 profile 的 `cordis.patch.yml` 里那段 `@local/kun-pet` 注册冲掉，
+于是 `/kun-pet/state` 变 404，桌宠悄悄退回「读会话缓存」的降级通道——只剩进行中 / 任务名，
+既没有「正在执行哪个工具」的细节，也没有桌宠上的 ✓/✗。**v2.4.9 起不用再手动重装**：
+
+- **更新完成后**会自动把插件补齐并重注册（幂等；失败不影响本次更新）；
+- **每次启动**若发现插件通道不可用，后台（限频一次 / 6 小时、独立进程、不阻塞 UI）自动从更新源拉取插件三件套、写入 profile 的 `.local-plugins` 并补回 `cordis.patch.yml` 注册；
+- 补齐后气泡会提示「请重启一次 DSH 生效」——**重启一次 DSH** 插件才会加载。
+
+> 自愈是 best-effort：即便失败也不影响桌宠本体，主通道（读 DSH 会话投影缓存）照常工作。
 
 ---
 
@@ -684,8 +698,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\tests\test-pi-sour
 | **桌宠「不见了」** | 先看任务管理器里有没有 `kun-pet-desktop.ps1` 的 powershell 进程。桌宠是「置顶 + 分层 + 工具窗口」，Windows 里 `MainWindowHandle` 恒为 0，常规「找窗口」方法看不到它；它可能只是被别的全屏 / 置顶窗口压在下面。按 `Win+D` 显示桌面，或右键菜单「重置位置」把它拉回屏幕内 |
 | 小宠一闪一闪 | 已在 v2 修复（空帧跳过 + 固定缩放取整位移）。若你自己换的素材仍有此问题，用 `docs/` 里的方法检查每行有效帧数 |
 | 素材在菜单里显示「需 WebP 扩展」 | 该素材只有 `.webp`，转成 `.png` 或装 Windows「Webp 图像扩展」 |
-| 审批气泡不弹 | 插件没加载：`http://127.0.0.1:19387/kun-pet/state` 返回 404 ⇒ 重启 DSH；再看 `~/.dsh/kun-pet-host.log` |
-| 审批气泡本来能用，装了别的插件后突然不弹了 | **插件被 pnpm 剪走了**（v2.4.1 修）：看 `<profile>\node_modules\.ignored\@local\` 里有没有 `kun-pet*`。有就说明被剪了 —— 重跑 `安装.cmd`（或 `install.ps1 -InstallPlugin`）会改回「目录联接 + `.local-plugins`」的装法，之后 pnpm 再怎么装包都不会动它 |
+| 审批气泡不弹 | 插件没加载：读 `~/.dsh/kun-pet-endpoint.json` 里的 `url`，请求它若 404 ⇒ 重启 DSH；**v2.4.9 起更新/启动会自动尝试补齐插件**，补齐后重启 DSH 即恢复。仍不行看 `~/.dsh/kun-pet-host.log` |
+| 审批气泡本来能用，装了别的插件后突然不弹了 | **插件被 pnpm 剪走了**（v2.4.1 修）：看 `<profile>\node_modules\.ignored\@local\` 里有没有 `kun-pet*`。有就说明被剪了 —— 重跑 `安装.cmd`（或 `install.ps1 -InstallPlugin`）会改回「目录联接 + `.local-plugins`」的装法，之后 pnpm 再怎么装包都不会动它。**v2.4.9 起更省事：更新或启动时桌宠会自动把插件补回并重注册，无需手动重装** |
 | 在桌宠上点了同意，Harness 卡片还挂着 | 旧版问题，已修（桌宠应答时会顺手 cancel 网页端那张远程卡片）；DSH 版本差异导致取不到内部结构时，会自动退回「先给桌宠 6 秒独占窗口」的兜底策略 |
 
 更细的原理与自查脚本见 [docs/internals.md](docs/internals.md) 与 [docs/troubleshooting.md](docs/troubleshooting.md)。
