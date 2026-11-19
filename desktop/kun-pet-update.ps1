@@ -360,6 +360,169 @@ function Install-UpdateFiles($staged, [string]$targetDir, [string]$backupRoot, [
     }
 }
 
+# ---------------- DSH 插件通道自愈 ----------------
+# 桌宠的「任务进展细节（正在执行哪个工具）」和「桌宠上直接同意/拒绝审批」依赖
+# DSH 插件 @local/kun-pet 提供的 /kun-pet/state 与 /kun-pet/approval。
+# 该插件是靠 profile 的 cordis.patch.yml 里一段 insert 被加载的；DSH 升级或资料
+# 同步有时会把这段 insert 冲掉，插件就不再加载、接口 404，桌宠只能退回
+# 「读会话缓存」的降级通道（日志只有一行 plugin channel: unavailable，很难看出原因）。
+#
+# 这段函数把插件补齐，更新流程与启动自检都会调用它。整段 best-effort：
+# 任何异常都只在返回值里给错误字符串，绝不抛出、绝不影响桌宠本体。
+
+# 找到要装插件的 DSH profile 目录。优先用给定名字（默认 desktop），
+# 其次「profiles 下只有一个」就用它，再退到 desktop。
+function Get-DshProfileDir([string]$preferred) {
+    try {
+        $root = Join-Path $env:USERPROFILE '.dsh\profiles'
+        if ($preferred) {
+            $p = Join-Path $root $preferred
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
+        if (Test-Path -LiteralPath $root) {
+            $dirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)
+            if ($dirs.Count -eq 1) { return $dirs[0].FullName }
+            $desk = Join-Path $root 'desktop'
+            if (Test-Path -LiteralPath $desk) { return $desk }
+        }
+    } catch { }
+    return $null
+}
+
+# 插件通道现在是否已经可用（读 ~/.dsh/kun-pet-endpoint.json 指向的地址，短超时 GET）。
+# 用来避免「已经能用还去补一遍」造成重复注册。任何异常都判为不可用。
+function Test-PetPluginLive([int]$timeoutSec = 3) {
+    try {
+        $ep = Join-Path $env:USERPROFILE '.dsh\kun-pet-endpoint.json'
+        if (-not (Test-Path -LiteralPath $ep)) { return $false }
+        $meta = [IO.File]::ReadAllText($ep, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $url = [string]$meta.url
+        if (-not $url) { return $false }
+        $r = Invoke-WebRequest -Uri $url -TimeoutSec $timeoutSec -UseBasicParsing -ErrorAction Stop
+        if ($null -eq $r -or [int]$r.StatusCode -ne 200) { return $false }
+        return ([string]$r.Content -match '"mode"')
+    } catch { return $false }
+}
+
+# 确保 DSH 插件 @local/kun-pet 已安装并注册。返回 @{ changed; restartNeeded; profileDir; error }
+#   - 正文放 .local-plugins\kun-pet（pnpm 不碰），node_modules\@local\kun-pet 用目录联接指过去；
+#   - profile 的 cordis.patch.yml 缺 insert 就补（先备份）；
+#   - 只有真的改动了才置 changed/restartNeeded（DSH 需要重启才读到新插件）。
+function Ensure-PetDshPlugin([string]$preferredProfile = 'desktop') {
+    $res = @{ changed = $false; restartNeeded = $false; profileDir = ''; error = '' }
+    try {
+        $profileDir = Get-DshProfileDir $preferredProfile
+        if (-not $profileDir) { $res.error = 'no-dsh-profile'; return $res }
+        $res.profileDir = $profileDir
+
+        $rawBase = [string]$script:updRawBase
+        if (-not $rawBase) { $res.error = 'no-update-source'; return $res }
+        $rawBase = $rawBase.TrimEnd('/')
+
+        # 1) 从更新源下载插件三件套（Host 半区），任一失败就放弃（不动磁盘）
+        $names = @('index.js', 'package.json', 'cordis.patch.yml')
+        $bytes = @{}
+        foreach ($f in $names) {
+            # 两点请求 + 短暂等待：实测首个 Invoke-WebRequest 偶尔会冷启动失败一次，
+            # 重试一次能把这种瞬时抖动挡掉（仍失败才放弃，不动磁盘）。
+            $b = $null
+            for ($attempt = 0; $attempt -lt 2; $attempt++) {
+                $b = Get-UpdateBytes ($rawBase + '/plugin/' + $f) 20
+                if ($null -ne $b -and $b.Length -gt 0) { break }
+                Start-Sleep -Milliseconds 250
+            }
+            if ($null -eq $b -or $b.Length -eq 0) { $res.error = "plugin download failed: $f"; return $res }
+            $bytes[$f] = $b
+        }
+        # index.js 粗校验：必须是那个插件（含端点字样），不能是 HTML/404 之类
+        $idxText = [System.Text.Encoding]::UTF8.GetString($bytes['index.js'])
+        if ($idxText.Length -lt 2000 -or ($idxText -notmatch '/kun-pet/state')) {
+            $res.error = 'plugin index.js looks invalid'
+            return $res
+        }
+
+        # 2) 正文落到 .local-plugins\kun-pet（bytes 比对，内容一致就不重写）
+        $pluginStore = Join-Path $profileDir '.local-plugins\kun-pet'
+        New-Item -ItemType Directory -Force -Path $pluginStore | Out-Null
+        foreach ($f in $names) {
+            $dst = Join-Path $pluginStore $f
+            $same = $false
+            if (Test-Path -LiteralPath $dst) {
+                try {
+                    $old = [System.IO.File]::ReadAllBytes($dst)
+                    if ($old.Length -eq $bytes[$f].Length) {
+                        $same = $true
+                        for ($i = 0; $i -lt $old.Length; $i++) { if ($old[$i] -ne $bytes[$f][$i]) { $same = $false; break } }
+                    }
+                } catch { $same = $false }
+            }
+            if (-not $same) {
+                [System.IO.File]::WriteAllBytes($dst, $bytes[$f])
+                $res.changed = $true
+            }
+        }
+
+        # 3) node_modules\@local\kun-pet 指向它（目录联接；拿不到权限就退回直接拷贝）
+        $dest = Join-Path $profileDir 'node_modules\@local\kun-pet'
+        $linkParent = Split-Path -Parent $dest
+        if (-not (Test-Path -LiteralPath $linkParent)) { New-Item -ItemType Directory -Force -Path $linkParent | Out-Null }
+        $linkOk = $false
+        try {
+            if (Test-Path -LiteralPath $dest) {
+                $existing = Get-Item -LiteralPath $dest -Force
+                if ($existing.LinkType -eq 'Junction' -or $existing.LinkType -eq 'SymbolicLink') {
+                    if ($existing.Target -and ((@($existing.Target) -join '') -like "*$pluginStore*")) {
+                        $linkOk = $true
+                    } else {
+                        [System.IO.Directory]::Delete($dest, $false)
+                    }
+                } else {
+                    Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop
+                }
+            }
+            if (-not $linkOk) {
+                New-Item -ItemType Junction -Path $dest -Target $pluginStore -ErrorAction Stop | Out-Null
+                $linkOk = $true
+                $res.changed = $true
+            }
+        } catch {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            foreach ($f in $names) { Copy-Item -LiteralPath (Join-Path $pluginStore $f) -Destination (Join-Path $dest $f) -Force }
+            $res.changed = $true
+        }
+
+        # 4) 注册：profile 的 cordis.patch.yml 里补 insert（幂等，缺了才加，先备份）
+        $patch = Join-Path $profileDir 'cordis.patch.yml'
+        $patchText = ''
+        if (Test-Path -LiteralPath $patch) { $patchText = [IO.File]::ReadAllText($patch, [Text.Encoding]::UTF8) }
+        if ($patchText -notmatch '(?m)^\s*name:\s*[''"]?@local/kun-pet[''"]?\s*$') {
+            $insertBlock = @(
+                '',
+                '# ---- Kun Like 桌宠（@local/kun-pet，自动补齐）----',
+                '- insert:',
+                '    - id: kun-pet',
+                "      name: '@local/kun-pet'",
+                '      config: {}'
+            ) -join "`n"
+            if (Test-Path -LiteralPath $patch) {
+                $bak = $patch + '.bak-kunpet-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+                try { Copy-Item -LiteralPath $patch -Destination $bak -Force } catch { }
+            }
+            $newText = $patchText
+            if ($newText.Length -gt 0 -and -not $newText.EndsWith("`n")) { $newText += "`n" }
+            $newText += $insertBlock + "`n"
+            [IO.File]::WriteAllText($patch, $newText, (New-Object Text.UTF8Encoding($false)))
+            $res.changed = $true
+        }
+
+        $res.restartNeeded = $res.changed
+        return $res
+    } catch {
+        $res.error = $_.Exception.Message
+        return $res
+    }
+}
+
 # ---------------- 组装一次完整更新（网络 + 磁盘）----------------
 # 这是给桌宠调用的入口。返回
 #   @{ ok; status; localVersion; remoteVersion; files; backupDir; error; notes }
@@ -373,6 +536,7 @@ function Invoke-PetUpdate([string]$targetDir, [string]$currentVersion, [string]$
     $out = @{
         ok = $false; status = 'failed'; localVersion = [string]$currentVersion
         remoteVersion = ''; files = @(); backupDir = $null; error = ''; notes = @()
+        pluginChanged = $false; pluginRestartNeeded = $false; pluginError = ''
     }
     # 取字节：优先用注入的 fetcher，其次走真实网络
     $fetch = {
@@ -434,6 +598,20 @@ function Invoke-PetUpdate([string]$targetDir, [string]$currentVersion, [string]$
         $out.backupDir = $inst.backupDir
         if ($inst.ok) {
             $out.ok = $true; $out.status = 'updated'
+            # best-effort：更新完成后顺手把 DSH 插件通道补齐（只走真实网络路径；
+            # 测试注入 $fetcher 时跳过，保持测试不触网）。失败不影响本次更新结果。
+            if ($null -eq $fetcher) {
+                try {
+                    if (-not (Test-PetPluginLive)) {
+                        $pr = Ensure-PetDshPlugin
+                        if ($null -ne $pr) {
+                            $out.pluginChanged = [bool]$pr.changed
+                            $out.pluginRestartNeeded = [bool]$pr.restartNeeded
+                            if ($pr.error) { $out.pluginError = [string]$pr.error }
+                        }
+                    }
+                } catch { $out.pluginError = $_.Exception.Message }
+            }
         } else {
             $out.error = $inst.error
             if ($inst.rolledBack) { $out.error = $out.error + '（已自动回滚到更新前的版本）' }

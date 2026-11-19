@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.8'
+    Version     = '2.4.9'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -2917,7 +2917,9 @@ $miUpdate.add_Click({
                         if ($null -ne $r -and $r.ok -eq $true -and [string]$r.status -eq 'updated') {
                             $filesDone = @($r.files)
                             Write-Log ("update: ok, replaced " + ($filesDone -join ','))
-                            Show-Notice ("🎉 已更新到 v$remoteDone`n共 $($filesDone.Count) 个文件，即将重启") 30
+                            $updHint = ''
+                            try { if ($r.pluginRestartNeeded) { $updHint = "`nDSH 插件通道已修复，请重启一次 DSH 生效" } } catch { }
+                            Show-Notice ("🎉 已更新到 v$remoteDone`n共 $($filesDone.Count) 个文件，即将重启" + $updHint) 30
                             Start-Sleep -Milliseconds 1200
                             Restart-Pet
                         } else {
@@ -4282,6 +4284,51 @@ try {
     }
 } catch {
     Write-Log ('desktop shortcut check failed: ' + $_.Exception.Message)
+}
+
+# 启动自检：DSH 插件通道若不可用，后台尝试自动补齐（不阻塞 UI、限频一次/6 小时）。
+# 为什么放在启动而不是只在「检查更新」里：老版本更新到 2.4.9 时，跑更新流程的是
+# 磁盘上的旧代码（不含自愈逻辑），新代码要等重启后才执行 —— 所以真正能把已损坏
+# 用户救回来的钩子在「新版本的启动」这一步。这里 spawn 一个独立进程跑，
+# 失败了最多是「这次没修成」，桌宠主通道（读会话缓存）照常工作，绝不影响使用。
+try {
+    if ($script:updateModuleLoaded -and (Get-Command -Name 'Ensure-PetDshPlugin' -ErrorAction SilentlyContinue)) {
+        $healMarker = Join-Path $env:USERPROFILE '.dsh\.kun-pet-plugin-heal'
+        $healDue = $true
+        if (Test-Path -LiteralPath $healMarker) {
+            try {
+                $ageH = ((Get-Date) - (Get-Item -LiteralPath $healMarker).LastWriteTime).TotalHours
+                if ($ageH -lt 6) { $healDue = $false }
+            } catch { }
+        }
+        if ($healDue -and -not (Test-PetPluginLive)) {
+            try { [IO.File]::WriteAllText($healMarker, (Get-Date).ToString('o')) } catch { }
+            $healMod = [string]$script:updateModulePath
+            $healLog = [string]$script:logDir
+            $healDir = Join-Path $env:LOCALAPPDATA 'KunPet'
+            if (-not (Test-Path -LiteralPath $healDir)) { New-Item -ItemType Directory -Force -Path $healDir | Out-Null }
+            $healScriptPath = Join-Path $healDir 'heal-plugin.ps1'
+            $healBody = @(
+                "`$ErrorActionPreference = 'SilentlyContinue'",
+                "`$mod = '" + $healMod + "'",
+                "`$c = [IO.File]::ReadAllText(`$mod, [Text.Encoding]::UTF8)",
+                ". ([ScriptBlock]::Create(`$c))",
+                "`$r = Ensure-PetDshPlugin",
+                "if (`$r -and `$r.changed) {",
+                "  `$log = Join-Path '" + $healLog + "' 'kun-pet-desktop.log'",
+                "  Add-Content -LiteralPath `$log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] plugin self-heal: installed -> restart DSH to apply (' + `$r.profileDir + ')')",
+                "}"
+            ) -join "`n"
+            [IO.File]::WriteAllText($healScriptPath, $healBody, (New-Object Text.UTF8Encoding($true)))
+            $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            Start-Process -FilePath $psExe -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $healScriptPath
+            ) -WindowStyle Hidden | Out-Null
+            Write-Log 'plugin self-heal scheduled'
+        }
+    }
+} catch {
+    Write-Log ('plugin self-heal schedule failed: ' + $_.Exception.Message)
 }
 
 $null = $window.ShowDialog()
