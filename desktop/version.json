@@ -7,5 +7,19 @@
     "性能：新增内存修剪 Invoke-MemoryTrim（GC 后 SetProcessWorkingSetSize 把不再使用的页面交还系统）：启动首次渲染完成后做一次，此后每 10 分钟且仅在空闲态（无任务/无等待/无拖拽）重复 —— 正在干活时不做，避免热页换出去又立刻调回的抖动；空闲工作集从 ~270MB 降到 ~100MB（进程再用时页面自动软调回，无感知）",
     "性能：DSH 文件通道按「大小+mtime」指纹缓存 —— 插件空闲时状态文件长期不变，轮询每 500ms 一次的读文件 + ConvertFrom-Json 全部省掉，文件真的被重写才重新解析（「陈旧→不可用」的结论同样缓存，不再每 500ms 白读一遍陈旧文件）",
     "行为微调：16 向视线（矢量形象）只在快速档推进 —— 完全静止时眼神跟着冻结（「最慢就是不动」），减速档下也不会因 tick 变慢而越转越慢"
+  ],
+  "files": [
+    "kun-pet-desktop.ps1",
+    "kun-pet-pi-source.ps1",
+    "kun-pet-wander.ps1",
+    "kun-pet-update.ps1",
+    "kun-pet-ui.ps1",
+    "启动桌宠.vbs",
+    "start-pet.vbs",
+    "启动桌宠.bat",
+    "ensure-pet-shortcut.ps1",
+    "make-shortcut.ps1",
+    "make-icon.ps1",
+    "version.json"
   ]
 }
