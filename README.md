@@ -20,6 +20,7 @@
 - [装形象素材（换皮肤）](#装形象素材换皮肤)
 - [可选：装 DSH 插件（任务进展 + 审批按钮）](#可选装-dsh-插件任务进展--审批按钮)
 - [更新到最新版](#更新到最新版)
+- [多桌面（多个虚拟桌面）](#多桌面多个虚拟桌面)
 - [让宠物到处跑（随机移动）](#让宠物到处跑随机移动)
 - [跟随 pi coding agent](#跟随-pi-coding-agent)
 - [可选：开机自启](#可选开机自启)
@@ -483,6 +484,61 @@ DSH 升级或资料同步有时会把 profile 的 `cordis.patch.yml` 里那段 `
 - 补齐后气泡会提示「请重启一次 DSH 生效」——**重启一次 DSH** 插件才会加载。
 
 > 自愈是 best-effort：即便失败也不影响桌宠本体，主通道（读 DSH 会话投影缓存）照常工作。
+
+---
+
+## 多桌面（多个虚拟桌面）
+
+Windows 的虚拟桌面（`Win+Tab` 上面那排、`Ctrl+Win+←/→` 切换）里，**每个窗口只属于它所在的那个桌面** ——
+所以桌宠默认只留在你启动它的那个桌面，切到新桌面就看不见了。
+
+右键菜单 → **「多桌面显示」**：
+
+| 选项 | 效果 |
+|---|---|
+| 跟随所有桌面（默认） | 你切到哪个桌面，小宠就跟到哪个桌面（0.4 秒内出现在新桌面上），体感与「钉在所有桌面」一致 |
+| 只留在初始桌面 | 反过来把窗口锁在启动时那个桌面，怎么切都不跟 |
+| 不管理 | 交回 Windows 默认行为（窗口只在它最初所在的那个桌面） |
+
+选择存进 `kun-pet-settings.json` 的 `vdMode`（`follow` / `fixed` / `off`），重启后原样恢复；选中立即生效。
+
+### 切过去时是「淡入探头」，不是「啪」一下
+
+跟随到新桌面时，小宠做 220ms 的入场过渡：淡入 + 上浮 10px + 从底边中心轻微放大（0.94 → 1.0，EaseOut）。
+它只驱动入场专用的两层变换（`enterOffset` / `enterScale`）和整层透明度，**不碰**呼吸、浮动、走路那几路逐帧动画
+写的属性，所以不会互相覆盖、画面也不会抖；暂停 / 「完全静止」模式下同样适用。
+
+日志里能看到 `virtual desktop: enter animation (#N)`，每次切桌面成功跟随后一条。
+
+### 为什么不直接「钉在所有桌面」
+
+Windows 没有这个公开 API。能用的只有 `IVirtualDesktopManager` 的三个方法：
+`IsWindowOnCurrentVirtualDesktop`、`GetWindowDesktopId`、`MoveWindowToDesktop`；
+而且 `MoveWindowToDesktop` **只允许移动本进程自己的窗口**（跨进程调用直接 `E_ACCESSDENIED`，
+这也是它必须由桌宠自己在进程内做、而不能像鼠标穿透那样交给外部工具的原因）：
+
+1. 每 400ms 检查一次 `IsWindowOnCurrentVirtualDesktop(自己的窗口)`；
+2. 不在当前桌面时，问出「当前桌面 GUID」：先看前台窗口，再枚举可见顶层窗口里「只在这个桌面可见」的那个；
+3. `MoveWindowToDesktop` 把窗口搬过去 —— 于是切桌面后 0.4 秒内它就出现在你眼前；
+4. 兜底：当前桌面是**空桌面**（一个窗口都没有，问不出 GUID）时，按注册表
+   `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\VirtualDesktopIDs`
+   里的桌面 GUID 逐个试，直到 `IsWindowOnCurrentVirtualDesktop` 变 `true`。
+
+`fixed` 模式同理，只是目标换成「启动时那个桌面」的 GUID，发现窗口不在那儿就搬回去。
+
+### 排错
+
+`kun-pet-desktop.log` 里这几行能定位问题：
+
+```
+virtual desktop: mode=follow · interop=ok        ← interop=ok 才说明 COM 接口可用
+virtual desktop follower started (mode=follow)
+virtual desktop: initial desktop = <GUID>
+virtual desktop: followed to <GUID>              ← 每次成功跟随都会记一条
+```
+
+- `interop=MISSING`：`Add-Type` 编译 COM 互操作失败（极旧的 PowerShell / 受限策略），功能自动关掉，桌宠其他部分照常；
+- 没有任何 `followed to`：先确认菜单里选的是「跟随所有桌面」，再看是不是被组策略或第三方虚拟桌面工具（Dexpot 等）接管了桌面切换。
 
 ---
 

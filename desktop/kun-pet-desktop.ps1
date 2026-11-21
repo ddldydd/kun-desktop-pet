@@ -63,7 +63,7 @@ $Config = @{
     Scale       = 0.62
     # 当前版本（检查更新时与远端的 version.json 比较）。
     # 这里写死一份「兜底值」：读不到 version.json 时也能正常判断。
-    Version     = '2.4.9'
+    Version     = '2.4.13'
     # 更新源与仓库（检查更新用）
     UpdateRawBase = 'https://raw.githubusercontent.com/ddldydd/kun-desktop-pet/main'
     RepoUrl       = 'https://github.com/ddldydd/kun-desktop-pet'
@@ -99,10 +99,28 @@ try {
     Add-Type -Namespace KunPet -Name Win32 -MemberDefinition @'
 [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+[DllImport("kernel32.dll")] public static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr min, IntPtr max);
 '@
     $script:clickThroughAvailable = $true
 } catch {
     Write-Log ("win32 interop unavailable: " + $_.Exception.Message)
+}
+
+# ---------------- 内存维护 ----------------
+# 常驻后台的小程序，任务管理器里的「工作集」是用户最直观的资源观感。
+# PowerShell + WPF 装载完基线就有 200MB 上下，其中大量是启动期一次性分配、
+# 之后长期不碰的页面。GC 之后调 SetProcessWorkingSetSize(-1,-1) 把这些页面
+# 交还给系统（进程再用时会自动软调回，无感知），工作集能从 ~270MB 降到 ~100MB。
+# 时机：启动渲染完成后做一次；此后每 10 分钟且仅在空闲态（无任务/无等待/无拖拽）
+# 重复 —— 正在干活时不做，避免把热页换出去又立刻软调回来的抖动。
+function Invoke-MemoryTrim {
+    try {
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect()
+        # (HANDLE)-1 = 当前进程伪句柄
+        [void][KunPet.Win32]::SetProcessWorkingSetSize([IntPtr](-1), [IntPtr](-1), [IntPtr](-1))
+    } catch { }
 }
 
 # 拖拽热路径：GetCursorPos + SetWindowPos 全程走物理像素，一次移动窗口。
@@ -210,6 +228,106 @@ namespace KunPet {
     $script:shellIconAvailable = $true
 } catch {
     Write-Log ("shell icon helper unavailable: " + $_.Exception.Message)
+}
+
+# ---------------- 虚拟桌面（Windows 多桌面）互操作 ----------------
+# 背景：一个窗口只属于创建它的那个虚拟桌面 —— 切到别的桌面，窗口就不在那儿了。
+# Windows 并没有「钉在所有桌面」的公开 API，能用的只有 IVirtualDesktopManager 的三个方法：
+#   IsWindowOnCurrentVirtualDesktop / GetWindowDesktopId / MoveWindowToDesktop。
+# 关键约束：MoveWindowToDesktop 只允许移动**本进程自己**的窗口（跨进程调用返回 E_ACCESSDENIED），
+# 所以这段逻辑必须跑在桌宠自己的进程里，不能像鼠标穿透那样甩给外部小工具。
+# 于是「一直在所有桌面」= 定时检查 + 发现不在当前桌面就把窗口搬过去（体感与置顶所有桌面一致）。
+$script:vdeskInteropAvailable = $false
+try {
+    if (-not ('KunPet.VDesk' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace KunPet {
+    public static class VDesk {
+        [ComImport, Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")]
+        public class VirtualDesktopManagerClass { }
+
+        [ComImport, Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B"),
+         InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IVirtualDesktopManager {
+            [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr h, out bool onCurrent);
+            [PreserveSig] int GetWindowDesktopId(IntPtr h, out Guid desktopId);
+            [PreserveSig] int MoveWindowToDesktop(IntPtr h, ref Guid desktopId);
+        }
+
+        static IVirtualDesktopManager _mgr;
+        static IVirtualDesktopManager Mgr {
+            get { if (_mgr == null) _mgr = (IVirtualDesktopManager)new VirtualDesktopManagerClass(); return _mgr; }
+        }
+
+        public static bool IsOnCurrent(IntPtr hwnd) {
+            try { bool on; return Mgr.IsWindowOnCurrentVirtualDesktop(hwnd, out on) == 0 && on; }
+            catch { return false; }
+        }
+
+        public static string DesktopId(IntPtr hwnd) {
+            try {
+                Guid g;
+                if (Mgr.GetWindowDesktopId(hwnd, out g) != 0 || g == Guid.Empty) return "";
+                return g.ToString("D");
+            } catch { return ""; }
+        }
+
+        public static bool MoveTo(IntPtr hwnd, string guid) {
+            try { Guid g = new Guid(guid); return Mgr.MoveWindowToDesktop(hwnd, ref g) == 0; }
+            catch { return false; }
+        }
+
+        // 找「当前虚拟桌面」的 GUID：先问前台窗口（它必然在当前桌面），
+        // 拿不到就枚举可见顶层窗口，取第一个「在别的桌面看不见、只在当前桌面」的窗口。
+        // 全屏换成空桌面（一个窗口都没有）时返回空串，调用方再走 GUID 逐个试探的兜底路径。
+        public static string CurrentDesktopId() {
+            try {
+                IntPtr fg = GetForegroundWindow();
+                if (fg != IntPtr.Zero) {
+                    string s = OnCurrentId(fg);
+                    if (!String.IsNullOrEmpty(s)) return s;
+                }
+                string found = null;
+                EnumWindows(delegate(IntPtr h, IntPtr p) {
+                    if (found != null) return false;
+                    if (!IsWindowVisible(h)) return true;
+                    string s = OnCurrentId(h);
+                    if (String.IsNullOrEmpty(s)) return true;
+                    StringBuilder sb = new StringBuilder(64);
+                    GetClassName(h, sb, 64);
+                    // Progman 是「桌面」本身，它的桌面 id 不可用，跳过
+                    if (sb.ToString() == "Progman") return true;
+                    found = s;
+                    return false;
+                }, IntPtr.Zero);
+                return found == null ? "" : found;
+            } catch { return ""; }
+        }
+
+        static string OnCurrentId(IntPtr h) {
+            bool on;
+            if (Mgr.IsWindowOnCurrentVirtualDesktop(h, out on) != 0 || !on) return null;
+            Guid g;
+            if (Mgr.GetWindowDesktopId(h, out g) != 0 || g == Guid.Empty) return null;
+            return g.ToString("D");
+        }
+
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+        delegate bool EnumProc(IntPtr h, IntPtr p);
+    }
+}
+'@
+    }
+    $script:vdeskInteropAvailable = $true
+} catch {
+    Write-Log ("virtual desktop interop unavailable: " + $_.Exception.Message)
 }
 
 # ---------------- 标准状态（与 Codex 桌宠九行一致） ----------------
@@ -327,9 +445,16 @@ $xaml = @'
         Topmost="True" ShowInTaskbar="False" SizeToContent="WidthAndHeight"
         ResizeMode="NoResize" ShowActivated="False"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
-  <Grid Margin="8" Background="Transparent">
+  <Grid x:Name="rootLayer" Margin="8" Background="Transparent">
+    <!-- 三层变换：浮动（逐帧动画写 floatTransform）/ 入场位移 / 入场缩放。
+         后两层只由「切虚拟桌面之后的出现过渡」驱动（Play-DesktopEnterAnimation），
+         动画循环不碰它们，所以不会和呼吸/浮动打架。 -->
     <Grid.RenderTransform>
-      <TranslateTransform x:Name="floatTransform" X="0" Y="0"/>
+      <TransformGroup>
+        <TranslateTransform x:Name="floatTransform" X="0" Y="0"/>
+        <TranslateTransform x:Name="enterOffset" X="0" Y="0"/>
+        <ScaleTransform x:Name="enterScale" ScaleX="1" ScaleY="1" CenterX="0" CenterY="0"/>
+      </TransformGroup>
     </Grid.RenderTransform>
     <StackPanel>
       <Border x:Name="alertBorder" Background="#F2E8453C" CornerRadius="10"
@@ -426,6 +551,10 @@ try {
     Write-Log ("xaml parse failed: " + $_.Exception.Message); exit 1
 }
 $floatTransform = $window.FindName('floatTransform')
+# 切虚拟桌面后的「出现」过渡用（见 Play-DesktopEnterAnimation）
+$rootLayerEl    = $window.FindName('rootLayer')
+$enterOffsetEl  = $window.FindName('enterOffset')
+$enterScaleEl   = $window.FindName('enterScale')
 $petScale       = $window.FindName('petScale')
 $userScaleEl    = $window.FindName('userScale')
 $petShellEl     = $window.FindName('petShell')
@@ -624,6 +753,23 @@ $state = [hashtable]::Synchronized(@{
     bubbleTheme = 'light'
     bubbleBg = ''
     bubbleFg = ''
+    # ---- 虚拟桌面（Windows 多桌面）----
+    # vdMode: 'follow' 跟随所有桌面（切到哪跟到哪，默认）/ 'fixed' 只留在启动时那个桌面 /
+    #         'off' 不管理（Windows 默认行为：窗口只在最初那个桌面）
+    # 默认 follow：Windows 没有「钉在所有桌面」的 API，跟随是唯一能保持「一直看得见」的做法。
+    vdMode = 'follow'
+    # vdEnterAnim: 切虚拟桌面时小宠「进场」的过渡动画（Play-DesktopEnterAnimation 用）
+    #   'off'      无过渡，直接出现
+    #   'simple'   简约淡入（淡入+上浮+微放大）
+    #   'bounce'   弹跳出场（默认：缩放带回弹，像 Q 弹地蹦出来）
+    #   'run-in'   跑场入场（从较近的屏幕边缘跑进来，配走路动画）
+    #   'drop'     空降落地（从上方 1.2 个身位落下，BounceEase 落地弹两下）
+    #   'teleport' 传送闪现（关键帧闪烁 + 冲出）
+    #   'random'   每次随机挑一个（不含 off）
+    # 默认 bounce：轮询跟随先天「晚到」，硬切/淡入都像凭空闪现；
+    # 带弹性的出场把「搬过来」的突兀感变成「小宠自己登场」的观感。
+    # 所有非 off 样式统一延后 vdEnterDelayMs 登场：等系统桌面滑动收尾，动效不被整屏运动吞掉。
+    vdEnterAnim = 'bounce'
     # ---- 随机移动（到处跑）----
     # wanderEnabled: 是否让小宠自己在桌面上溜达（右键菜单开关，持久化）
     # 默认**关**：宠物自己会动是有打扰性的，必须由用户主动开启。
@@ -1764,11 +1910,22 @@ function Get-StateFromDshHttp {
 
 # 文件通道：只在快照还新鲜时采信（插件每次状态变化都会重写它；
 # 等审批时秒数每秒在变，所以等待期间一定是新鲜的；DSH 崩了留下的陈旧文件会被忽略）
+# 【v2.4.13 性能】先比对文件指纹（大小+mtime），没变化就直接复用上次结果
+# （包括「陈旧→$null」这个结论）：插件空闲时文件长期不变，轮询每 500ms 一次的
+# 读文件 + ConvertFrom-Json 全部省掉；只有文件真的被重写才重新解析。
+$script:dshFileCacheKey = ''
+$script:dshFileCacheSnap = $null
 function Get-StateFromDshFile {
     try {
         if (-not (Test-Path -LiteralPath $script:stateFilePath)) { return $null }
+        $fi = Get-Item -LiteralPath $script:stateFilePath -ErrorAction Stop
+        $fkey = '{0}|{1}' -f $fi.Length, $fi.LastWriteTimeUtc.Ticks
+        if ($fkey -eq $script:dshFileCacheKey) { return $script:dshFileCacheSnap }
         $resp = Get-Content -LiteralPath $script:stateFilePath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $resp) { return $null }
+        if ($null -eq $resp) {
+            $script:dshFileCacheKey = $fkey; $script:dshFileCacheSnap = $null
+            return $null
+        }
         $updatedAt = 0
         try { if ($resp.updatedAt) { $updatedAt = [int64]$resp.updatedAt } } catch { $updatedAt = 0 }
         $fresh = $false
@@ -1776,12 +1933,17 @@ function Get-StateFromDshFile {
             $ageSec = ((Get-Date).ToUniversalTime() - $script:epochRef).TotalMilliseconds - $updatedAt
             $fresh = ($ageSec -ge -5000 -and $ageSec -lt ($script:stateFileFreshSec * 1000))
         } else {
-            $ageSec = ((Get-Date) - (Get-Item -LiteralPath $script:stateFilePath).LastWriteTime).TotalSeconds
+            $ageSec = ((Get-Date) - $fi.LastWriteTime).TotalSeconds
             $fresh = ($ageSec -lt $script:stateFileFreshSec)
         }
-        if (-not $fresh) { return $null }
+        if (-not $fresh) {
+            $script:dshFileCacheKey = $fkey; $script:dshFileCacheSnap = $null
+            return $null
+        }
         $snap = Convert-DshSnapshot $resp 'dsh-file'
         if ($null -ne $snap) { $snap.approvalChannel = 'file' }
+        $script:dshFileCacheKey = $fkey
+        $script:dshFileCacheSnap = $snap
         return $snap
     } catch { return $null }
 }
@@ -1939,6 +2101,10 @@ function Save-Settings {
             piEnabled = [bool]$state.piEnabled
             # 随机移动：默认关，同样用「字段是否存在」判断（见 Load-Settings）
             wander = [bool]$state.wanderEnabled
+            # 多桌面显示模式：'follow' 跟随所有桌面 / 'fixed' 只留初始桌面 / 'off' 不管理
+            vdMode = [string]$state.vdMode
+            # 切桌面入场动画样式：off/simple/bounce/run-in/teleport/random（见 $state 注释）
+            vdEnterAnim = [string]$state.vdEnterAnim
             animSpeed = $state.animSpeed
             # 气泡配色：主题 + 自定义色（custom 才用到后两项，存着方便下次改回来）
             bubbleTheme = [string]$state.bubbleTheme
@@ -2039,6 +2205,19 @@ function Load-Settings {
         if ($null -ne $saved.wander) {
             $state.wanderEnabled = [bool]$saved.wander
         }
+        # 多桌面显示：只接受三个合法值，其他（旧配置/手改坏了）保持默认 follow
+        if ($null -ne $saved.vdMode) {
+            $vm = ([string]$saved.vdMode).Trim().ToLowerInvariant()
+            if ($vm -eq 'follow' -or $vm -eq 'fixed' -or $vm -eq 'off') { $state.vdMode = $vm }
+        }
+        # 切桌面入场动画：七选一，非法值保持默认 bounce
+        if ($null -ne $saved.vdEnterAnim) {
+            $vea = ([string]$saved.vdEnterAnim).Trim().ToLowerInvariant()
+            if ($vea -eq 'off' -or $vea -eq 'simple' -or $vea -eq 'bounce' -or
+                $vea -eq 'run-in' -or $vea -eq 'teleport' -or $vea -eq 'drop' -or $vea -eq 'random') {
+                $state.vdEnterAnim = $vea
+            }
+        }
         # 动作速度：数字倍率或 'still'；非法值保持默认 1.0
         if ($null -ne $saved.animSpeed) {
             $as = $saved.animSpeed
@@ -2080,6 +2259,415 @@ function Load-Settings {
     } catch {
         Write-Log ("settings load failed: " + $_.Exception.Message)
     }
+}
+
+# ---------------- 虚拟桌面：跟随 / 锚定 ----------------
+# 这两个函数只负责「窗口该在哪个桌面」；什么时候调用由末尾的 vdTimer 决定。
+$script:vdHwnd = [IntPtr]::Zero
+$script:vdFixedGuid = ''      # 启动时窗口所在桌面（fixed 模式的锚点，也用作「最开始的桌面」）
+$script:vdLastGood = ''       # 最近一次确认「宠物就在当前桌面」时的桌面 GUID
+$script:vdFollowCount = 0
+$script:vdLastMode = ''
+$script:vdErrorCount = 0
+
+# 读注册表里这台机器的虚拟桌面 GUID 列表（顺序即桌面顺序）。
+# 只在「当前桌面上一个窗口都没有」时用于逐个试探 —— 空桌面没有窗口可问，只能试。
+function Get-VdDesktopGuids {
+    try {
+        $raw = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops' -ErrorAction Stop).VirtualDesktopIDs
+        $out = New-Object System.Collections.ArrayList
+        $i = 0
+        while ($null -ne $raw -and ($i + 16) -le $raw.Count) {
+            [void]$out.Add((New-Object guid (,[byte[]]($raw[$i..($i + 15)]))).ToString())
+            $i += 16
+        }
+        return @($out)
+    } catch {
+        return @()
+    }
+}
+
+# 切虚拟桌面之后的「出现」过渡 —— 按 $state.vdEnterAnim 分样式（值域见 $state 处注释）。
+# 为什么需要：窗口是被 MoveWindowToDesktop 瞬间搬到新桌面的，用户看到的就是「啪」一下出现；
+# 换成带缓动的入场，观感上像「小宠自己登场」，不再是硬切。
+# 所有样式共同的三条约束：
+#   1) 只动 rootLayer.Opacity / enterOffset / enterScale（run-in 额外动 Window.Left）——
+#      前三样都不在逐帧动画的写入路径上（floatTransform / petScale 才是），
+#      所以不会和呼吸/浮动/走路抢同一属性（抢了会互相覆盖，画面会抖）。
+#   2) 动画开始前先把 Opacity 压到 0：窗口刚被搬到新桌面、到动画第一帧之间会渲染一帧，
+#      不压的话那一帧是全亮的（正是「啪一下出现」的来源），压完再交给动画。
+#   3) 兜底在 Play-DesktopEnterAnimation 的 catch：Opacity 可能停在 0，必须拉回 1，
+#      否则宠物会「消失」。
+$script:enterAnimCount = 0
+
+# 入场统一延后一点：桌宠是轮询发现的（最多晚 ~180ms），被搬过来时多半还撞上
+# 系统桌面滑动动画的尾巴 —— 整屏都在动的时候，任何原地淡入/缩放都会被吞掉，等于没放。
+# 先隐身（本地 Opacity=0）等 ~260ms 让画面落定，再让小宠登场：
+# 「屏幕停稳 → 小宠上场」是一个完整的节拍，动效这才看得见。
+$script:vdEnterDelayMs = 260
+
+# run-in / drop 样式会真实移动窗口位置，期间 wander 步进与 SizeChanged 重锚定都必须让路，
+# 否则走路步进/底边重锚会把窗口往回拽，两股力打架画面会抖。
+# 用时间戳而不是动画 Completed 事件：动画可能被下一次 BeginAnimation 打断而永远不触发
+# Completed，时间戳到点自动失效，不存在「卡死在 busy」的可能。
+$script:vdEnterBusyUntil = [datetime]::MinValue
+function Test-VdEnterBusy {
+    return (Get-Date) -lt $script:vdEnterBusyUntil
+}
+
+# 用户抓起小宠（拖拽激活）时调用：立刻停掉入场动画并解除 busy，别跟鼠标抢位置。
+# run-in 动 Left、drop 动 Top，两个都要清；淡入/缩放也要清 —— 它们带 260ms 的
+# BeginTime，延迟期里宠物是隐身的，拖在手里必须立刻现形（Opacity 基值被压成过 0，
+# 清完动画要显式拉回 1）。清掉动画后各属性落回基值：enterOffset=0 / enterScale=1。
+function Stop-VdEnterWindowAnim {
+    try {
+        $script:vdEnterBusyUntil = [datetime]::MinValue
+        if ($null -ne $window) {
+            $window.BeginAnimation([System.Windows.Window]::LeftProperty, $null)
+            $window.BeginAnimation([System.Windows.Window]::TopProperty, $null)
+        }
+        if ($null -ne $rootLayerEl) {
+            $rootLayerEl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+            $rootLayerEl.Opacity = 1.0
+            $enterOffsetEl.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $null)
+            $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $null)
+            $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $null)
+        }
+    } catch { }
+}
+
+# 给一段动画统一挂「延迟登场」的 BeginTime（延迟期间动画不生效，隐身等场）
+function Add-EnterBeginTime([object]$anim) {
+    try { $anim.BeginTime = [TimeSpan]::FromMilliseconds($script:vdEnterDelayMs) } catch { }
+}
+
+# simple：淡入 + 上浮 + 微放大（底边中心），~400ms。
+# 原版 220ms/10px/0.94 的观感太微妙，肉眼基本无感，等于没放；这里拉长加猛一档。
+function Invoke-VdEnterSimple {
+    $dur = New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds(400))
+    $ease = New-Object System.Windows.Media.Animation.CubicEase
+    $ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+
+    $rootLayerEl.Opacity = 0.0
+    $fade = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.0, 1.0, $dur)
+    $fade.EasingFunction = $ease
+    Add-EnterBeginTime $fade
+    $rootLayerEl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
+
+    $move = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(24.0, 0.0, $dur)
+    $move.EasingFunction = $ease
+    Add-EnterBeginTime $move
+    $enterOffsetEl.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $move)
+
+    # 以「底边中心」为基准放大：像是从桌面里冒出来，而不是整块凭空变大。
+    # 尺寸是 SizeToContent（气泡一变就变），所以每次动画前都重算中心点。
+    $w = [double]$rootLayerEl.ActualWidth
+    $h = [double]$rootLayerEl.ActualHeight
+    if ($w -gt 1 -and $h -gt 1) {
+        $enterScaleEl.CenterX = $w / 2.0
+        $enterScaleEl.CenterY = $h
+        $sx = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.75, 1.0, $dur)
+        $sx.EasingFunction = $ease
+        Add-EnterBeginTime $sx
+        $sy = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.75, 1.0, $dur)
+        $sy.EasingFunction = $ease
+        Add-EnterBeginTime $sy
+        $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $sx)
+        $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $sy)
+    }
+}
+
+# bounce（默认）：弹跳出场。缩放从 0.4 带回弹冲到 1（BackEase 过冲再回落），像 Q 弹地蹦出来；
+# 淡入只给 160ms —— 弹跳本身是主角，透明度只需把「第一帧全亮」压掉。
+function Invoke-VdEnterBounce {
+    $dur = New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds(550))
+    $back = New-Object System.Windows.Media.Animation.BackEase
+    $back.Amplitude = 0.5
+    $back.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+
+    $rootLayerEl.Opacity = 0.0
+    $fade = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.0, 1.0, (New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds(160))))
+    Add-EnterBeginTime $fade
+    $rootLayerEl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
+
+    $w = [double]$rootLayerEl.ActualWidth
+    $h = [double]$rootLayerEl.ActualHeight
+    if ($w -gt 1 -and $h -gt 1) {
+        $enterScaleEl.CenterX = $w / 2.0
+        $enterScaleEl.CenterY = $h
+        $sx = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.40, 1.0, $dur)
+        $sx.EasingFunction = $back
+        Add-EnterBeginTime $sx
+        $sy = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.40, 1.0, $dur)
+        $sy.EasingFunction = $back
+        Add-EnterBeginTime $sy
+        $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $sx)
+        $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $sy)
+    }
+}
+
+# teleport：传送闪现。透明度关键帧快速闪一下（0→1→0.2→1），同时缩放 0.3 带过冲冲到 1，
+# 观感是「啪地传送进来、还带一点余韵」。
+function Invoke-VdEnterTeleport {
+    $durMs = 420
+    $rootLayerEl.Opacity = 0.0
+    $blink = New-Object System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+    foreach ($spec in @(@(0.0, 0), @(1.0, 110), @(0.2, 220), @(1.0, $durMs))) {
+        $kf = New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame -ArgumentList (
+            [double]$spec[0],
+            [System.Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromMilliseconds([int]$spec[1]))
+        )
+        # IList.Add 会把索引吐到输出流，必须吞掉，否则每次传送闪现都往控制台漏 4 行数字
+        [void]$blink.KeyFrames.Add($kf)
+    }
+    Add-EnterBeginTime $blink
+    $rootLayerEl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $blink)
+
+    $back = New-Object System.Windows.Media.Animation.BackEase
+    $back.Amplitude = 0.3
+    $back.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+    $dur = New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds($durMs))
+    $w = [double]$rootLayerEl.ActualWidth
+    $h = [double]$rootLayerEl.ActualHeight
+    if ($w -gt 1 -and $h -gt 1) {
+        $enterScaleEl.CenterX = $w / 2.0
+        $enterScaleEl.CenterY = $h
+        $sx = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.30, 1.0, $dur)
+        $sx.EasingFunction = $back
+        Add-EnterBeginTime $sx
+        $sy = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.30, 1.0, $dur)
+        $sy.EasingFunction = $back
+        Add-EnterBeginTime $sy
+        $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $sx)
+        $enterScaleEl.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $sy)
+    }
+}
+
+# drop：空降落地。窗口（连宠带气泡一起）从最终位置上方 1.2 个身位自由落体，
+# BounceEase 落地弹两下 —— 全程都是位移，是观感最明确的一档。
+# 动 Window.Top 而不是 enterOffset：位移超出窗口矩形的内容会被窗口裁掉，
+# 挪整个窗口才能让小宠「从天上掉下来」穿过桌面空间，而不是从隐形天花板后钻出来。
+function Invoke-VdEnterDrop {
+    $w = [double]$window.ActualWidth
+    $h = [double]$window.ActualHeight
+    if ($h -le 1 -or $w -le 1) { Invoke-VdEnterBounce; return }
+    $finalTop = [double]$window.Top
+    $fromTop = $finalTop - $h * 1.2 - 20.0
+    $ms = 650
+    $script:vdEnterBusyUntil = (Get-Date).AddMilliseconds($script:vdEnterDelayMs + $ms + 300)
+
+    $rootLayerEl.Opacity = 0.0
+    $fade = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.0, 1.0, (New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds(110))))
+    Add-EnterBeginTime $fade
+    $rootLayerEl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
+
+    $bounce = New-Object System.Windows.Media.Animation.BounceEase
+    $bounce.Bounces = 2
+    $bounce.Bounciness = 3.0
+    $bounce.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+    $dur = New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds($ms))
+    $fall = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @($fromTop, $finalTop, $dur)
+    $fall.EasingFunction = $bounce
+    Add-EnterBeginTime $fall
+    $window.BeginAnimation([System.Windows.Window]::TopProperty, $fall)
+}
+
+# run-in 的两个手感旋钮：
+#   跑速 = 宠物平时步速（wander 每帧步进）× vdEnterRunPaceX，匀速无缓动；
+#   可见跑程最长 vdEnterRunMaxMs 毫秒（离边缘太远时起点往回收一点，跑动中淡入登场）。
+$script:vdEnterRunPaceX = 1.4
+$script:vdEnterRunMaxMs = 3200
+
+# run-in：从较近的屏幕左右边缘「跑进来」，真实移动窗口（Window.Left 是依赖属性，可动画），
+# 同时用 Set-Action 播走路动作让腿动起来；方向按小宠本体离哪边边缘近自动选。
+# 起跑点以「小宠本体」的矩形为准，而不是整个窗口：气泡一展开窗口会比小宠宽一大截，
+# 按窗口贴屏幕边算，本体其实早就在屏幕里一大截了，观感就是「没从边缘来」。
+# 量出本体在窗口里的位置，让起跑时本体刚好完全在屏幕外，才是真正的「从边缘跑进来」。
+# 速度与宠物自己的移动节奏同源（见顶部旋钮注释）；量不到尺寸/屏幕 bounds 时退回弹跳样式。
+function Invoke-VdEnterRunIn {
+    $w = [double]$window.ActualWidth
+    if ($w -le 1) { Invoke-VdEnterBounce; return }
+    $vs = Get-VirtualScreenBounds
+    if ($null -eq $vs) { Invoke-VdEnterBounce; return }
+    $finalLeft = [double]$window.Left
+
+    # 量小宠本体在窗口里的矩形（petShell 是 140x140 格子套 LayoutTransform 缩放，
+    # ActualWidth 即缩放后的实际显示宽度；TranslatePoint 给出它在窗口里的左上角）
+    $petOffX = 0.0
+    $petW = $w
+    try {
+        if ($null -ne $petShellEl) {
+            $pt = $petShellEl.TranslatePoint((New-Object System.Windows.Point -ArgumentList 0, 0), $window)
+            if ($null -ne $pt) {
+                $petOffX = [double]$pt.X
+                $pw = [double]$petShellEl.ActualWidth
+                if ($pw -gt 1) { $petW = $pw }
+            }
+        }
+    } catch { }
+    $petCenterX = $finalLeft + $petOffX + $petW / 2.0
+    $midX = (($vs.Left + $vs.Right) / 2.0)
+    if ($petCenterX -le $midX) {
+        # 本体从左边缘外进场（本体右缘 = 屏幕左缘 - 6px），面朝右跑
+        $from = $vs.Left - $petOffX - $petW - 6.0
+        $dir = 'running-right'
+        if ($from -ge $finalLeft) { Invoke-VdEnterBounce; return }
+    } else {
+        # 本体从右边缘外进场（本体左缘 = 屏幕右缘 + 6px），面朝左跑
+        $from = $vs.Right - $petOffX + 6.0
+        $dir = 'running-left'
+        if ($from -le $finalLeft) { Invoke-VdEnterBounce; return }
+    }
+    $dist = [math]::Abs($finalLeft - $from)
+    if ($dist -lt 120.0) { Invoke-VdEnterBounce; return }
+    # 与 wander 同速：wanderSpeed px / AnimFpsMs ms（都拿不到就用默认 3px/40ms ≈ 75px/s）。
+    # 两个手感旋钮同样兜底默认值 —— 常量万一没定义（比如被裁剪的宿主环境）也不能算出 NaN。
+    $ws = 3.0
+    try { if ($null -ne $script:wanderSpeed) { $ws = [double]$script:wanderSpeed } } catch { }
+    $fms = 40.0
+    try { if ($null -ne $Config -and $null -ne $Config.AnimFpsMs) { $fms = [double]$Config.AnimFpsMs } } catch { }
+    $pace = 1.4
+    try { if ($null -ne $script:vdEnterRunPaceX) { $pace = [double]$script:vdEnterRunPaceX } } catch { }
+    $maxMs = 3200
+    try { if ($null -ne $script:vdEnterRunMaxMs) { $maxMs = [double]$script:vdEnterRunMaxMs } } catch { }
+    $speed = ($ws / $fms) * $pace              # px/ms
+    $maxDist = $speed * $maxMs
+    if ($dist -gt $maxDist) {
+        if ($from -gt $finalLeft) { $from = $finalLeft + $maxDist } else { $from = $finalLeft - $maxDist }
+        $dist = $maxDist
+    }
+    $msRaw = $dist / $speed
+    if ([double]::IsNaN($msRaw) -or [double]::IsInfinity($msRaw)) { Invoke-VdEnterBounce; return }
+    $ms = [int][math]::Max(600, [math]::Min(3200, $msRaw))
+    $script:vdEnterBusyUntil = (Get-Date).AddMilliseconds($script:vdEnterDelayMs + $ms + 300)
+    $dur = New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds($ms))
+
+    $rootLayerEl.Opacity = 0.0
+    $fade = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @(0.0, 1.0, (New-Object System.Windows.Duration -ArgumentList ([TimeSpan]::FromMilliseconds(140))))
+    Add-EnterBeginTime $fade
+    $rootLayerEl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
+
+    # 不加 EasingFunction：匀速直线，和 wander 恒定步进一致
+    $run = New-Object System.Windows.Media.Animation.DoubleAnimation -ArgumentList @($from, $finalLeft, $dur)
+    Add-EnterBeginTime $run
+    $window.BeginAnimation([System.Windows.Window]::LeftProperty, $run)
+    # 反应时长 = 延迟 + 跑动时长 + 一点余量：落地后腿再迈两步才停下，不那么机械
+    Set-Action $dir ($script:vdEnterDelayMs + $ms + 150)
+}
+
+function Play-DesktopEnterAnimation {
+    try {
+        if ($null -eq $rootLayerEl) { return }
+        $style = [string]$state.vdEnterAnim
+        if ($style -eq 'random') {
+            # 随机换花样：每次进场随机挑一个具体样式（off 不参与 —— 选 random 就是要看戏）
+            $style = Get-Random -InputObject @('simple', 'bounce', 'run-in', 'teleport', 'drop')
+        }
+        $script:enterAnimCount++
+        # 只在切桌面时触发，量很小；带样式名，便于确认「过渡真的播了、播的是哪套」
+        Write-Log ('virtual desktop: enter animation (' + $style + ' #' + $script:enterAnimCount + ')')
+        if ($style -eq 'off') { return }
+        if ($style -eq 'run-in') { Invoke-VdEnterRunIn; return }
+        if ($style -eq 'drop') { Invoke-VdEnterDrop; return }
+        if ($style -eq 'teleport') { Invoke-VdEnterTeleport; return }
+        if ($style -eq 'bounce') { Invoke-VdEnterBounce; return }
+        Invoke-VdEnterSimple   # 兜底：未知值按 simple（原版观感）处理
+    } catch {
+        # 兜底：透明度可能停在 0（动画没跑成），必须恢复，否则宠物会「消失」
+        try { $rootLayerEl.Opacity = 1.0 } catch { }
+        try { $script:vdEnterBusyUntil = [datetime]::MinValue } catch { }
+        Note-TickError 'enter-anim' $_
+    }
+}
+
+function Update-VirtualDesktopMode {
+    try {
+        if (-not $script:vdeskInteropAvailable) { return }
+        $h = [IntPtr]$script:vdHwnd
+        if ($h -eq [IntPtr]::Zero) { return }
+        $mode = [string]$state.vdMode
+
+        if ($mode -ne $script:vdLastMode) {
+            $script:vdLastMode = $mode
+            Write-Log ('virtual desktop mode: ' + $mode)
+        }
+        if ($mode -eq 'off') { return }
+
+        # 首次运行：记下「启动时所在桌面」，fixed 模式靠它把窗口拉回来
+        if (-not $script:vdFixedGuid) {
+            $g0 = [KunPet.VDesk]::DesktopId($h)
+            if ($g0) {
+                $script:vdFixedGuid = $g0
+                Write-Log ('virtual desktop: initial desktop = ' + $g0)
+            }
+        }
+
+        if ($mode -eq 'fixed') {
+            if (-not $script:vdFixedGuid) { return }
+            $cur = [KunPet.VDesk]::DesktopId($h)
+            if ($cur -and $cur -ne $script:vdFixedGuid) {
+                if ([KunPet.VDesk]::MoveTo($h, $script:vdFixedGuid)) {
+                    Write-Log ('virtual desktop: pulled back to initial desktop ' + $script:vdFixedGuid)
+                    # 被拉回时若用户正看着那个桌面，同样给一段淡入，避免「啪」一下冒出来
+                    Play-DesktopEnterAnimation
+                }
+            }
+            return
+        }
+
+        # follow：就在当前桌面时只顺手记住「当前桌面是谁」，切走以后少猜几步
+        if ([KunPet.VDesk]::IsOnCurrent($h)) {
+            $g1 = [KunPet.VDesk]::DesktopId($h)
+            if ($g1) { $script:vdLastGood = $g1 }
+            return
+        }
+
+        # 不在当前桌面 → 问出当前桌面 GUID，搬过去
+        $target = [KunPet.VDesk]::CurrentDesktopId()
+        if ($target) {
+            if ([KunPet.VDesk]::MoveTo($h, $target) -and [KunPet.VDesk]::IsOnCurrent($h)) {
+                $script:vdLastGood = $target
+                $script:vdFollowCount++
+                Write-Log ('virtual desktop: followed to ' + $target + ' (#' + $script:vdFollowCount + ')')
+                Play-DesktopEnterAnimation
+                return
+            }
+        }
+
+        # 兜底：当前桌面是「空桌面」（没有窗口可问）→ 按注册表列表逐个试
+        foreach ($g in (Get-VdDesktopGuids)) {
+            if ($g -eq $script:vdLastGood) { continue }
+            if ([KunPet.VDesk]::MoveTo($h, $g) -and [KunPet.VDesk]::IsOnCurrent($h)) {
+                $script:vdLastGood = $g
+                $script:vdFollowCount++
+                Write-Log ('virtual desktop: followed to ' + $g + ' by probing (#' + $script:vdFollowCount + ')')
+                Play-DesktopEnterAnimation
+                return
+            }
+        }
+    } catch {
+        if ($script:vdErrorCount -lt 5) {
+            $script:vdErrorCount++
+            Write-Log ('virtual desktop error: ' + $_.Exception.Message)
+        }
+    }
+}
+
+function Update-VdMenuChecks {
+    try {
+        foreach ($k in @($script:vdItems.Keys)) {
+            $script:vdItems[$k].Checked = ([string]$state.vdMode -eq [string]$k)
+        }
+    } catch { }
+}
+
+# 「切换入场动画」子菜单的勾选同步，模式与 Update-VdMenuChecks 相同
+function Update-VdEnterAnimMenuChecks {
+    try {
+        foreach ($k in @($script:vdEnterAnimItems.Keys)) {
+            $script:vdEnterAnimItems[$k].Checked = ([string]$state.vdEnterAnim -eq [string]$k)
+        }
+    } catch { }
 }
 
 function Apply-Scale {
@@ -2691,6 +3279,68 @@ $miWander.add_Click({
 })
 $menu.Items.Add($miWander) | Out-Null
 
+# 多桌面显示：Windows 没有「钉在所有桌面」的公开 API（见文件顶部的 VDesk 说明），
+# 所以「一直在所有桌面」的做法是「跟着切过去」——切桌面后 0.4 秒内小宠出现在新桌面上，
+# 体感与置顶所有桌面一致；「只留在初始桌面」则相反，把窗口锁回启动时那个桌面。
+$script:vdItems = @{}
+$vdMenu = [System.Windows.Forms.ToolStripMenuItem]::new('多桌面显示')
+$vdMenu.Enabled = $script:vdeskInteropAvailable
+$script:vdPresets = @(
+    @{ label = '跟随所有桌面（切到哪跟到哪）'; value = 'follow' },
+    @{ label = '只留在初始桌面';              value = 'fixed'  },
+    @{ label = '不管理（Windows 默认行为）';  value = 'off'    }
+)
+foreach ($preset in $script:vdPresets) {
+    $item = [System.Windows.Forms.ToolStripMenuItem]::new([string]$preset.label)
+    $item.Tag = [string]$preset.value
+    $item.add_Click({
+        param($sender, $eventArgs)
+        try {
+            $state.vdMode = [string]$sender.Tag
+            Update-VdMenuChecks
+            # 立刻生效一次，不用等下一个 400ms 轮询
+            Update-VirtualDesktopMode
+            Save-Settings
+        } catch {
+            Note-TickError 'vd-mode' $_
+        }
+    })
+    $script:vdItems[[string]$preset.value] = $item
+    $vdMenu.DropDownItems.Add($item) | Out-Null
+}
+# 切桌面入场动画样式：挂在「多桌面显示」下面的二级菜单。
+# 意义依附于 interop（没有 interop 就不会切桌面进场），Enabled 跟 vdMenu 保持一致。
+$script:vdEnterAnimItems = @{}
+$vdEnterMenu = [System.Windows.Forms.ToolStripMenuItem]::new('切换入场动画')
+$vdEnterMenu.Enabled = $script:vdeskInteropAvailable
+$script:vdEnterAnimPresets = @(
+    @{ label = '弹跳出场（默认）';             value = 'bounce'   },
+    @{ label = '跑场入场（从屏幕边缘跑进来）'; value = 'run-in'   },
+    @{ label = '空降落地（从天上掉下来）';     value = 'drop'     },
+    @{ label = '传送闪现';                     value = 'teleport' },
+    @{ label = '简约淡入';                     value = 'simple'   },
+    @{ label = '随机换花样';                   value = 'random'   },
+    @{ label = '无过渡（直接出现）';           value = 'off'      }
+)
+foreach ($preset in $script:vdEnterAnimPresets) {
+    $item = [System.Windows.Forms.ToolStripMenuItem]::new([string]$preset.label)
+    $item.Tag = [string]$preset.value
+    $item.add_Click({
+        param($sender, $eventArgs)
+        try {
+            $state.vdEnterAnim = [string]$sender.Tag
+            Update-VdEnterAnimMenuChecks
+            Save-Settings
+        } catch {
+            Note-TickError 'vd-enter-anim' $_
+        }
+    })
+    $script:vdEnterAnimItems[[string]$preset.value] = $item
+    $vdEnterMenu.DropDownItems.Add($item) | Out-Null
+}
+[void]$vdMenu.DropDownItems.Add($vdEnterMenu)
+$menu.Items.Add($vdMenu) | Out-Null
+
 # pi coding agent 兼容开关：关掉后桌宠完全不理 pi（只跟 DSH），
 # 适合「不想看到 pi 的任务混进来」的场景。持久化到 kun-pet-settings.json。
 $miPi = [System.Windows.Forms.ToolStripMenuItem]::new('兼容 pi coding agent')
@@ -3145,6 +3795,10 @@ $menu.add_Closed({
 function Show-PetMenu {
     try {
         $state.menuOpen = $true
+        # 每次打开都按当前设置重刷勾选：手改 kun-pet-settings.json、或设置被别的入口改过时，
+        # 菜单不会还给用户看旧状态（多桌面那几项尤其容易被外部改）。
+        try { Update-VdMenuChecks } catch { }
+        try { Update-VdEnterAnimMenuChecks } catch { }
         # 先关一次：上次菜单若处于半开状态（Closed 偶发不触发，menuOpen 就卡 true），
         # 直接 Show 会把那个僵尸状态带进来；关掉能让状态机重新走一遍 Opening/Closed
         try { if ($menu.Visible) { $menu.Close() } } catch { }
@@ -3266,6 +3920,11 @@ Write-Log ('pi compatibility: ' + $(if ($state.piEnabled) { 'enabled' } else { '
 $miWander.Checked = [bool]$state.wanderEnabled
 Update-SpeedMenuChecks
 Write-Log ('wander: ' + $(if ($state.wanderEnabled) { 'enabled' } else { 'disabled' }) + $(if (-not $script:wanderModuleLoaded) { ' (module missing!)' } else { '' }))
+# 多桌面显示模式的勾选（菜单同样在 Load-Settings 之前建的）
+Update-VdMenuChecks
+# 切桌面入场动画的勾选同理
+Update-VdEnterAnimMenuChecks
+Write-Log ('virtual desktop: mode=' + [string]$state.vdMode + ' · enterAnim=' + [string]$state.vdEnterAnim + ' · interop=' + $(if ($script:vdeskInteropAvailable) { 'ok' } else { 'MISSING' }))
 # 版本与更新模块状态：排查「检查更新点了没反应」时先看这两行
 Write-Log ('version: ' + (Get-PetVersion) + ' · update module: ' + $(if ($script:updateModuleLoaded) { 'loaded' } else { 'MISSING' }) + ' · source: ' + (Get-UpdateSource))
 # 启动时若处于暂停：先按当前状态画一帧，避免气泡停在上一个会话的旧文字或 "..."
@@ -3278,8 +3937,19 @@ $script:menuStuckTicks = 0
 $script:dragStart = $null
 $pollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $pollTimer.Interval = [TimeSpan]::FromMilliseconds($Config.PollMs)
+$script:lastTrimAt = Get-Date
 $pollTimer.Add_Tick({
     try {
+        # ---- 周期性内存修剪（v2.4.13 性能）----
+        # 空闲态每 10 分钟把不再使用的工作集页面交还系统（见 Invoke-MemoryTrim）。
+        # 条件不满足时这里只有一个日期比较，开销为零。
+        if ((((Get-Date) - $script:lastTrimAt).TotalMinutes -ge 10) -and
+            (-not [bool]$state.dragging) -and (-not [bool]$state.menuOpen) -and (-not [bool]$state.waiting) -and
+            ([string]$state.mode -eq 'idle' -or [string]$state.mode -eq 'disconnected')) {
+            $script:lastTrimAt = Get-Date
+            Invoke-MemoryTrim
+        }
+
         # ---- 卡住自愈（看门狗）：必须放在「拖拽/菜单跳过轮询」之前 ----
         # 两个真实发生过的卡死形态（用户反馈「宠物完全静止、操作不了」）：
         #   1) 拖拽状态残留：按下后 MouseUp 没送达（鼠标捕获被弹窗/菜单模态循环
@@ -3644,11 +4314,23 @@ function Update-Wander {
 
 # ---------------- 动画 ----------------
 $script:phase = 0.0
+$script:chromeTickN = 0
 $animTimer = New-Object System.Windows.Threading.DispatcherTimer
 $animTimer.Interval = [TimeSpan]::FromMilliseconds($Config.AnimFpsMs)
 $animTimer.Add_Tick({
     try {
         $pausedNow = [bool]$state.paused
+        # 【v2.4.13 性能】自适应频率：暂停 / 完全静止时画面上没有任何逐帧动画
+        # （帧不推进、浮动不动、相位冻结），tick 只剩气泡/提示这类文字刷新，
+        # 250ms 一轮绰绰有余 —— 40ms 全速跑是纯浪费。恢复动画（继续/换速度）
+        # 后下一轮立刻回到 40ms，最多 250ms 的过渡延迟，肉眼不可见。
+        # 两个降速档里 $script:phase 都不参与画面（paused 分支整段跳过；
+        # still 分支相位冻结），所以切换间隔不需要补偿相位步进。
+        $slowNow = $pausedNow -or ([string]$state.animSpeed -eq 'still')
+        $wantMs = if ($slowNow) { 250.0 } else { [double]$Config.AnimFpsMs }
+        if ([double]$animTimer.Interval.TotalMilliseconds -ne $wantMs) {
+            $animTimer.Interval = [TimeSpan]::FromMilliseconds($wantMs)
+        }
         $tickPlan = Get-PetTickPlan @{ dragging = [bool]$state.dragging; paused = $pausedNow; menuOpen = [bool]$state.menuOpen; walking = (Test-PetIsWalking) }
         # 显示动作用局部变量，不回写 $state.action：
         # 拖拽/反应是临时覆盖，回写会导致松手后动作卡住不回待机
@@ -3670,7 +4352,8 @@ $animTimer.Add_Tick({
         # 随机移动：先挪窗口（内部会自己判断能不能动），再决定播哪个动作。
         # 放在这里（而不是轮询定时器）是因为它要跟动画同步：40ms 一步走着才顺，
         # 500ms 一步会变成一跳一跳的。
-        if ($tickPlan.wander) { Update-Wander }
+        # run-in 入场动画正在移动窗口时让路，否则走路步进会把窗口拽回去跟动画打架
+        if ($tickPlan.wander -and -not (Test-VdEnterBusy)) { Update-Wander }
         if (-not $state.dragging -and -not ($state.reaction -and (Get-Date) -lt $state.reactionEnd)) {
             $dir = [string]$state.wanderLastDir
             if ([bool]$state.wanderEnabled -and ($dir -eq 'running-left' -or $dir -eq 'running-right')) {
@@ -3702,11 +4385,15 @@ $animTimer.Add_Tick({
             $state.frame = $state.frame + 1
             $state.frameAt = $now
         }
-        # 16 向视线：约每 700ms 顺时针一格
-        $state.lookTick = $state.lookTick + 1
-        if ($state.lookTick -ge 18) {
-            $state.lookTick = 0
-            $state.lookIndex = ($state.lookIndex + 1) % 16
+        # 16 向视线：约每 700ms 顺时针一格。
+        # 【v2.4.13】只在快速档推进：减速档（暂停/完全静止）里视线跟着冻结 ——
+        # 「完全静止」本来就该连眼神都不动，而且慢速档下按 tick 计数会越转越慢。
+        if (-not $slowNow) {
+            $state.lookTick = $state.lookTick + 1
+            if ($state.lookTick -ge 18) {
+                $state.lookTick = 0
+                $state.lookIndex = ($state.lookIndex + 1) % 16
+            }
         }
 
         $amp = [double]$anim.amp
@@ -3749,6 +4436,16 @@ $animTimer.Add_Tick({
         # 拖拽中冻结气泡/底部提示：SizeToContent 一改字就改窗口尺寸，
         # SizeChanged 再去改 Left/Top，跟鼠标抢位置，拖着就会卡。
         if (-not $tickPlan.updateChrome) { return }
+
+        # ---- 文字刷新节流（v2.4.13 性能）----
+        # 气泡/进度/底部提示这一段有几十条语句 + 每帧重新拼字符串，快速档 25Hz
+        # 全速跑是空闲 CPU 的大头之一；而文字本来就不追求逐帧时效（时长提示
+        # 特意用分钟粒度防闪），160ms 的延迟肉眼不可见。快速档每 4 轮跑一次；
+        # 减速档（250ms）本来就慢，每轮都跑。
+        if (-not $slowNow) {
+            $script:chromeTickN = ($script:chromeTickN + 1) -band 3
+            if ($script:chromeTickN -ne 0) { return }
+        }
 
         # ---- 等待用户介入：气泡给「不一样的、看得懂」的提示 ----
         # 权限审批（桌宠上可直接 ✓/✗）与 Agent 提问（带选项）分开措辞，配色也不同，
@@ -4037,6 +4734,8 @@ $window.Add_MouseMove({
                 if ($p.moved) {
                     $script:dragStart.moved = $true
                     $state.dragging = $true
+                    # 用户抓起小宠：立刻停掉入场位移动画（run-in 的 Left / drop 的 Top），别跟鼠标抢位置
+                    Stop-VdEnterWindowAnim
                 }
                 if (-not $state.dragging) { return }
                 if ([string]$state.dragDir -ne [string]$p.dir) { $state.dragDir = [string]$p.dir }
@@ -4061,6 +4760,8 @@ $window.Add_MouseMove({
                 if ($p.moved) {
                     $script:dragStart.moved = $true
                     $state.dragging = $true
+                    # 用户抓起小宠：立刻停掉入场位移动画（run-in 的 Left / drop 的 Top），别跟鼠标抢位置
+                    Stop-VdEnterWindowAnim
                 }
                 if (-not $state.dragging) { return }
                 $state.dragDir = [string]$p.dir
@@ -4166,10 +4867,46 @@ $window.Add_MouseRightButtonUp({
 
 $window.Add_Closed({
     $pollTimer.Stop(); $animTimer.Stop(); $script:clickTimer.Stop()
+    try { $script:vdTimer.Stop() } catch { }
     Save-Settings
     try { $notify.Visible = $false } catch { }
     try { if ($mutex) { $mutex.ReleaseMutex() } } catch { }
     Write-Log 'kun-pet-desktop stopped'
+})
+
+# ---------------- 虚拟桌面跟随（多桌面）----------------
+$script:vdTimer = New-Object System.Windows.Threading.DispatcherTimer
+# 180ms 一轮：切桌面是人的动作，这个间隔足够快（配合 220ms 的入场淡入，
+# 观感上是「切过去 → 小宠淡入探头」，而不是先空一下再「啪」出现）。
+# 间隔再大（比如 1s）会明显「切过去先空一下，宠物才冒出来」。
+# 检查本身很轻（GetForegroundWindow + 一次 COM 调用，微秒级），不需要更保守。
+$script:vdTimer.Interval = [TimeSpan]::FromMilliseconds(180)
+$script:vdTimer.Add_Tick({ try { Update-VirtualDesktopMode } catch { } })
+
+# 启动后首次渲染完成：装载期的临时分配此时都可以交还了（见 Invoke-MemoryTrim）。
+# 加一次性标记兜底 —— 即使 ContentRendered 因某种原因再次触发也不会反复 GC。
+$script:trimOnBootDone = $false
+$window.Add_ContentRendered({
+    if ($script:trimOnBootDone) { return }
+    $script:trimOnBootDone = $true
+    try { Invoke-MemoryTrim } catch { }
+})
+
+# 窗口句柄要等窗口真正创建（ShowDialog 内部）才有，所以放在 Loaded 里拿。
+$window.Add_Loaded({
+    try {
+        $script:vdHwnd = ([System.Windows.Interop.WindowInteropHelper]::new($window)).Handle
+        if ($script:vdeskInteropAvailable -and $script:vdHwnd -ne [IntPtr]::Zero) {
+            # 先跑一次：记下「初始桌面」，fixed 模式立刻就有锚点
+            Update-VirtualDesktopMode
+            $script:vdTimer.Start()
+            Write-Log ('virtual desktop follower started (mode=' + [string]$state.vdMode + ')')
+        } else {
+            Write-Log 'virtual desktop follower unavailable; multi-desktop features off'
+        }
+    } catch {
+        Write-Log ('virtual desktop init failed: ' + $_.Exception.Message)
+    }
 })
 
 # 不做「鼠标停在小宠身上就刹停走动」：那是割裂感的来源 —— 想点/拖它时
@@ -4187,7 +4924,8 @@ $window.Add_SizeChanged({
     try {
         if ($script:syncingSize) { return }
         # 拖着或自己走路时别改 Left/Top：气泡/提示一变宽会把窗口拽回去，像卡停。
-        if ($state.dragging -or (Test-PetIsWalking)) { return }
+        # run-in 入场动画正在移动窗口时同样让路，否则重锚定会跟动画抢 Left/Top。
+        if ($state.dragging -or (Test-PetIsWalking) -or (Test-VdEnterBusy)) { return }
         $w = [double]$window.ActualWidth
         $h = [double]$window.ActualHeight
         if ($w -le 0 -or $h -le 0) { return }
